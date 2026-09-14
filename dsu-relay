@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""DSU (cemuhook) relay for Eden.
+
+Reads the iio-dsu-bridge stream meant for Cemu (127.0.0.1:26760), converts accelerometer and gyro into
+the frame Eden's DSU client expects, and republishes it on 127.0.0.1:26761 at a fixed 200 Hz, the same
+rate Eden samples motion for the game (src/hid_core/resources/six_axis/six_axis.cpp). Only one process
+reads the IMU, and the game sees each sample once.
+
+Tested on ROG Ally X (BMI323) with the official iio-dsu-bridge rog-ally.yaml
+(mount_matrix x[1,0,0] y[0,-1,0] z[0,0,-1]). Other devices or configs need a different conversion.
+
+Usage:
+  dsu-relay                 run the relay
+  dsu-relay --check 15      compare 26760 with another DSU server on 26761 and estimate the matrix
+"""
+import argparse
+import random
+import select
+import socket
+import struct
+import threading
+import time
+import zlib
+
+PROTO_VERSION = 1001
+MSG_VERSION = 0x00100000
+MSG_INFO = 0x00100001
+MSG_DATA = 0x00100002
+MAC = bytes([0x02, 0x20, 0x6A, 0x7E, 0x51, 0x01])
+
+# Cemu bridge: mount_matrix x[1,0,0] y[0,-1,0] z[0,0,-1] on both sensors.
+# Frame verified for Eden: accel diag(-1,1,1), gyro 0.866667*I (0.866667 = 312/360 undoes Eden's 1/312 gyro scale).
+# So accel_eden = diag(-1,-1,-1) * accel_cemu and gyro_eden = 0.866667 * diag(1,-1,-1) * gyro_cemu.
+GYRO_SCALE = 0.866667
+ACCEL_MATRIX = ((-1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
+GYRO_MATRIX = ((GYRO_SCALE, 0.0, 0.0), (0.0, -GYRO_SCALE, 0.0), (0.0, 0.0, -GYRO_SCALE))
+
+STALE_SECONDS = 0.1       # stop sending if the bridge has been silent this long
+SUB_TIMEOUT_SECONDS = 10  # Eden renews its subscription every 3 s
+LOG_EVERY_SECONDS = 60
+
+
+def apply(m, v):
+    return tuple(m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] for i in range(3))
+
+
+def finish_packet(buf):
+    struct.pack_into("<I", buf, 8, 0)
+    struct.pack_into("<I", buf, 8, zlib.crc32(bytes(buf)) & 0xFFFFFFFF)
+    return bytes(buf)
+
+
+def build_packet(server_id, msg_type, payload):
+    buf = bytearray(20 + len(payload))
+    buf[0:4] = b"DSUS"
+    struct.pack_into("<HHIII", buf, 4, PROTO_VERSION, len(payload) + 4, 0, server_id, msg_type)
+    buf[20:] = payload
+    return finish_packet(buf)
+
+
+def build_version(server_id):
+    return build_packet(server_id, MSG_VERSION, struct.pack("<H", PROTO_VERSION))
+
+
+def shared_beginning(slot, state):
+    return bytes([slot, state, 2, 1]) + MAC + bytes([0x05])
+
+
+def build_info(server_id, slot, state):
+    return build_packet(server_id, MSG_INFO, shared_beginning(slot, state) + bytes([1 if state == 2 else 0]))
+
+
+def build_data(server_id, counter, timestamp_us, accel, gyro):
+    """Same layout as buildControllerData in iio-dsu-bridge."""
+    p = bytearray(80)
+    p[0:11] = shared_beginning(0, 2)
+    p[11] = 1
+    struct.pack_into("<I", p, 12, counter & 0xFFFFFFFF)
+    p[20:24] = bytes([128] * 4)
+    struct.pack_into("<Q", p, 48, timestamp_us)
+    struct.pack_into("<3f", p, 56, *accel)
+    struct.pack_into("<3f", p, 68, *gyro)
+    return build_packet(server_id, MSG_DATA, bytes(p))
+
+
+def build_subscribe(client_id):
+    body = struct.pack("<I", MSG_DATA) + bytes([0, 0]) + bytes(6)
+    buf = bytearray(b"DSUC" + struct.pack("<HHII", PROTO_VERSION, len(body), 0, client_id) + body)
+    return finish_packet(buf)
+
+
+def parse_data(packet):
+    """(counter, accel_g, gyro_dps) from a DSU pad data packet, or None."""
+    if len(packet) < 100 or packet[:4] != b"DSUS" or struct.unpack_from("<I", packet, 16)[0] != MSG_DATA:
+        return None
+    return (struct.unpack_from("<I", packet, 32)[0],
+            struct.unpack_from("<3f", packet, 76),
+            struct.unpack_from("<3f", packet, 88))
+
+
+class Relay:
+    def __init__(self, upstream_port=26760, listen_port=26761, rate=200.0, host="127.0.0.1", log=print):
+        self.upstream = (host, upstream_port)
+        self.rate = rate
+        self.log = log
+        self.server_id = random.getrandbits(32)
+        self.up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.up.bind((host, 0))
+        self.up.settimeout(0.2)
+        self.down = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.down.bind((host, listen_port))
+        self.down.settimeout(0.2)
+        self.listen_port = self.down.getsockname()[1]
+        self.lock = threading.Lock()
+        self.latest = None  # (arrival time, accel, gyro) in Eden's frame
+        self.subs = {}      # address -> [last renewal, counter]
+        self.stop = threading.Event()
+        self.stats = {"upstream": 0, "sent": 0}
+        self.threads = []
+
+    def _upstream_loop(self):
+        subscribe = build_subscribe(random.getrandbits(32))
+        last_subscribe = 0.0
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if now - last_subscribe >= 1.0:
+                try:
+                    self.up.sendto(subscribe, self.upstream)
+                except OSError:
+                    pass
+                last_subscribe = now
+            try:
+                data, _ = self.up.recvfrom(2048)
+            except OSError:  # timeout, or port closed while the bridge restarts
+                continue
+            parsed = parse_data(data)
+            if parsed:
+                _, accel, gyro = parsed
+                sample = (time.monotonic(), apply(ACCEL_MATRIX, accel), apply(GYRO_MATRIX, gyro))
+                with self.lock:
+                    self.latest = sample
+                    self.stats["upstream"] += 1
+
+    def _downstream_loop(self):
+        while not self.stop.is_set():
+            try:
+                data, addr = self.down.recvfrom(2048)
+            except OSError:
+                continue
+            if len(data) < 20 or data[:4] != b"DSUC" or struct.unpack_from("<H", data, 4)[0] != PROTO_VERSION:
+                continue
+            msg = struct.unpack_from("<I", data, 16)[0]
+            replies = []
+            if msg in (MSG_VERSION, MSG_INFO, MSG_DATA):
+                replies.append(build_version(self.server_id))
+            if msg == MSG_INFO and len(data) >= 24:
+                count = max(0, min(struct.unpack_from("<i", data, 20)[0], 4))
+                for slot in data[24:24 + count]:
+                    replies.append(build_info(self.server_id, slot, 2 if slot == 0 else 0))
+            elif msg == MSG_DATA and len(data) >= 28:
+                flags, slot = data[20], data[21]
+                if flags == 0 or (flags & 0x01 and slot == 0):
+                    with self.lock:
+                        self.subs.setdefault(addr, [0.0, 0])[0] = time.monotonic()
+                    replies.append(build_info(self.server_id, 0, 2))
+            for reply in replies:
+                try:
+                    self.down.sendto(reply, addr)
+                except OSError:
+                    pass
+
+    def _emit_loop(self):
+        period = 1.0 / self.rate
+        next_tick = time.monotonic()
+        last_info = 0.0
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if now < next_tick:
+                time.sleep(next_tick - now)
+                continue
+            next_tick += period
+            if now - next_tick > 0.05:  # fell behind (e.g. suspend): restart the schedule from now
+                next_tick = now + period
+            with self.lock:
+                for addr in [a for a, e in self.subs.items() if now - e[0] > SUB_TIMEOUT_SECONDS]:
+                    del self.subs[addr]
+                sample = self.latest
+                targets = []
+                if sample and now - sample[0] <= STALE_SECONDS:
+                    for addr, entry in self.subs.items():
+                        entry[1] += 1
+                        targets.append((addr, entry[1]))
+                infos = list(self.subs) if now - last_info >= 0.5 else []
+            if infos:
+                last_info = now
+            timestamp_us = int(now * 1_000_000)
+            for addr, counter in targets:
+                try:
+                    self.down.sendto(build_data(self.server_id, counter, timestamp_us, sample[1], sample[2]), addr)
+                    self.stats["sent"] += 1
+                except OSError:
+                    pass
+            for addr in infos:
+                try:
+                    self.down.sendto(build_info(self.server_id, 0, 2), addr)
+                except OSError:
+                    pass
+
+    def start(self):
+        for target in (self._upstream_loop, self._downstream_loop, self._emit_loop):
+            thread = threading.Thread(target=target, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+
+    def close(self):
+        self.stop.set()
+        for thread in self.threads:
+            thread.join(timeout=1)
+        self.up.close()
+        self.down.close()
+
+    def run(self, seconds=0):
+        self.start()
+        self.log(f"DSU relay: {self.upstream[0]}:{self.upstream[1]} -> {self.upstream[0]}:{self.listen_port} at {self.rate:g} Hz")
+        start = last_log = time.monotonic()
+        last_stats = dict(self.stats)
+        try:
+            while not seconds or time.monotonic() - start < seconds:
+                time.sleep(0.2)
+                now = time.monotonic()
+                if now - last_log >= LOG_EVERY_SECONDS:
+                    window = now - last_log
+                    with self.lock:
+                        subs = len(self.subs)
+                    self.log(f"from bridge {(self.stats['upstream'] - last_stats['upstream']) / window:.0f}/s, "
+                             f"sent {(self.stats['sent'] - last_stats['sent']) / window:.0f}/s, subscribers {subs}")
+                    last_stats = dict(self.stats)
+                    last_log = now
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.close()
+
+
+def invert3(m):
+    a, b, c = m[0]
+    d, e, f = m[1]
+    g, h, i = m[2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    scale = ((a + e + i) / 3.0) ** 3
+    if scale <= 0 or det <= 0.01 * scale:
+        return None
+    return [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
+
+
+def fit_matrix(pairs):
+    """Least squares: the matrix M such that output ~= M * input, from (output, input) pairs."""
+    cc = [[0.0] * 3 for _ in range(3)]
+    ec = [[0.0] * 3 for _ in range(3)]
+    for out, inp in pairs:
+        for i in range(3):
+            for j in range(3):
+                cc[i][j] += inp[i] * inp[j]
+                ec[i][j] += out[i] * inp[j]
+    inv = invert3(cc)
+    if inv is None:
+        return None
+    return [[sum(ec[i][k] * inv[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def check(seconds, cemu_port=26760, eden_port=26761, host="127.0.0.1", log=print):
+    """Compare two DSU servers and estimate the matrix from the first to the second. True if it matches the relay's."""
+    socks = {}
+    for name, port in (("cemu", cemu_port), ("eden", eden_port)):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((host, 0))
+        s.setblocking(False)
+        socks[name] = (s, (host, port))
+    subscribe = build_subscribe(random.getrandbits(32))
+    accel_pairs, gyro_pairs = [], []
+    latest_cemu = None
+    start = time.monotonic()
+    last_subscribe = 0.0
+    log(f"Comparing for {seconds:g} s: slowly rotate the device in every direction.")
+    try:
+        while time.monotonic() - start < seconds:
+            now = time.monotonic()
+            if now - last_subscribe >= 1.0:
+                for s, addr in socks.values():
+                    try:
+                        s.sendto(subscribe, addr)
+                    except OSError:
+                        pass
+                last_subscribe = now
+            ready, _, _ = select.select([s for s, _ in socks.values()], [], [], 0.1)
+            for s in ready:
+                try:
+                    data, _ = s.recvfrom(2048)
+                except OSError:
+                    continue
+                parsed = parse_data(data)
+                if not parsed:
+                    continue
+                arrived = time.monotonic()
+                if s is socks["cemu"][0]:
+                    latest_cemu = (arrived, parsed[1], parsed[2])
+                elif latest_cemu and arrived - latest_cemu[0] < 0.02:
+                    accel_pairs.append((parsed[1], latest_cemu[1]))
+                    gyro_pairs.append((parsed[2], latest_cemu[2]))
+    finally:
+        for s, _ in socks.values():
+            s.close()
+
+    log(f"Sample pairs: {len(accel_pairs)}")
+    if len(accel_pairs) < 300:
+        log("RESULT: not enough data. Make sure both DSU servers are running.")
+        return False
+    ok = True
+    for label, pairs, expected, tolerance in (("accelerometer", accel_pairs, ACCEL_MATRIX, 0.1),
+                                              ("gyroscope", gyro_pairs, GYRO_MATRIX, 0.15)):
+        fitted = fit_matrix(pairs)
+        if fitted is None:
+            log(f"{label}: not enough motion to estimate the matrix, repeat rotating around every axis.")
+            ok = False
+            continue
+        worst = max(abs(fitted[i][j] - expected[i][j]) for i in range(3) for j in range(3))
+        log(f"{label}: estimated {[[round(v, 2) for v in row] for row in fitted]}")
+        log(f"{label}: expected  {[[round(v, 2) for v in row] for row in expected]}  max error {worst:.3f}")
+        ok = ok and worst < tolerance
+    log("RESULT: " + ("OK, the relay conversion matches." if ok else "does NOT match."))
+    return ok
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--upstream-port", type=int, default=26760)
+    parser.add_argument("--listen-port", type=int, default=26761)
+    parser.add_argument("--rate", type=float, default=200.0)
+    parser.add_argument("--check", type=float, metavar="SECONDS", help="compare the two ports instead of running the relay")
+    args = parser.parse_args()
+    log = lambda text: print(text, flush=True)
+    if args.check:
+        raise SystemExit(0 if check(args.check, args.upstream_port, args.listen_port, log=log) else 1)
+    Relay(args.upstream_port, args.listen_port, args.rate, log=log).run()
+
+
+if __name__ == "__main__":
+    main()

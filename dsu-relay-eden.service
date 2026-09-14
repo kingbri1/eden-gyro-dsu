@@ -1,0 +1,12 @@
+[Unit]
+Description=DSU relay for Eden (26760 -> 26761 at 200 Hz)
+After=iio-dsu-bridge.service
+Wants=iio-dsu-bridge.service
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/bin/dsu-relay
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
