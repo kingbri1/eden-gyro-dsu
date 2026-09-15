@@ -1,7 +1,7 @@
 [Unit]
 Description=DSU relay for Eden (26760 -> 26761 at 200 Hz)
-After=iio-dsu-bridge.service
-Wants=iio-dsu-bridge.service
+# No ordering on iio-dsu-bridge.service: its unit has After=default.target, which would create a
+# start-up cycle and systemd would drop the bridge. The relay waits for bridge data on its own.
 
 [Service]
 ExecStart=/usr/bin/python3 %h/.local/bin/dsu-relay
