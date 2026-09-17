@@ -63,7 +63,7 @@ ss -uln | grep -E ':2676[01]'
 ## 3. Eden
 
 1. Launch Eden **from Gaming Mode** (in Desktop Mode it does not see the controller). In
-   *Emulation → Configure → Controls*, set Player 1 to Pro Controller and map the buttons to
+   *Emulation > Configure > Controls*, set Player 1 to Pro Controller and map the buttons to
    **Steam Virtual Gamepad**. Close Eden.
 2. Point Motion 1 at the relay (a backup of `qt-config.ini` is written first):
 
