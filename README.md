@@ -11,7 +11,7 @@ at the same time, keeping Xbox-style glyphs, Steam Input and the default InputPl
 
 - Through InputPlumber's virtual controllers, Eden gets broken motion data: the Steam Deck target has an unscaled,
   rotated accelerometer and the DualSense target has a fake sensor timestamp and a bad calibration report
-  (InputPlumber issue: <LINK>). With Steam Input on, Eden only sees Steam's virtual pad, which has no sensors.
+  (InputPlumber issue: https://github.com/ShadowBlip/InputPlumber/issues/715). With Steam Input on, Eden only sees Steam's virtual pad, which has no sensors.
 - [iio-dsu-bridge](https://github.com/Sebalvarez97/iio-dsu-bridge) reads the IMU directly and serves it over
   cemuhook/DSU. Cemu and Eden need different axis conventions, but running a second bridge halves the sample rate
   (both poll the same sensor), and at ~120 Hz Eden's motion steering gets stuck on one side.
@@ -49,8 +49,8 @@ Needs only Python 3, which Bazzite already ships.
 
 ```bash
 mkdir -p ~/.local/bin ~/.config/systemd/user
-curl -fL <RAW_URL>/dsu-relay -o ~/.local/bin/dsu-relay && chmod +x ~/.local/bin/dsu-relay
-curl -fL <RAW_URL>/dsu-relay-eden.service -o ~/.config/systemd/user/dsu-relay-eden.service
+curl -fL https://gist.githubusercontent.com/SimpleMatt7/64b5b9d68045338f9cfa754a8f4f2a3d/raw/dsu-relay -o ~/.local/bin/dsu-relay && chmod +x ~/.local/bin/dsu-relay
+curl -fL https://gist.githubusercontent.com/SimpleMatt7/64b5b9d68045338f9cfa754a8f4f2a3d/raw/dsu-relay-eden.service -o ~/.config/systemd/user/dsu-relay-eden.service
 systemctl --user daemon-reload && systemctl --user enable --now dsu-relay-eden.service
 ```
 
@@ -68,7 +68,7 @@ ss -uln | grep -E ':2676[01]'
 2. Point Motion 1 at the relay (a backup of `qt-config.ini` is written first):
 
 ```bash
-curl -fL <RAW_URL>/eden-motion-dsu.py -o /tmp/eden-motion-dsu.py && python3 /tmp/eden-motion-dsu.py
+curl -fL https://gist.githubusercontent.com/SimpleMatt7/64b5b9d68045338f9cfa754a8f4f2a3d/raw/eden-motion-dsu.py -o /tmp/eden-motion-dsu.py && python3 /tmp/eden-motion-dsu.py
 ```
 
 It sets, in `~/.config/eden/qt-config.ini`:
@@ -119,6 +119,10 @@ To restore Eden, copy back the `qt-config.ini.bak-*` file created next to `qt-co
 
 ## Upstream reports
 
-- InputPlumber (Deck/DualSense target IMU): <LINK>
-- iio-dsu-bridge (`-addr` ignored, second instance halves the rate): <LINK>
-- Eden (six-axis sampling at fixed 5 ms, DSU 1/312 scale): <LINK>
+- InputPlumber (Deck/DualSense target IMU): https://github.com/ShadowBlip/InputPlumber/issues/715
+- iio-dsu-bridge (`-addr` ignored, second instance halves the rate): https://github.com/Sebalvarez97/iio-dsu-bridge/issues/14
+
+## Disclosure
+
+The investigation, the relay, the Eden setup script and this guide were written with the help of Claude (Anthropic),
+and tested by me on a ROG Ally X.
