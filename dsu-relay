@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: MIT
 """DSU (cemuhook) relay for Eden.
 
-Reads the iio-dsu-bridge stream meant for Cemu (127.0.0.1:26760), converts accelerometer and gyro into
-the frame Eden's DSU client expects, and republishes it on 127.0.0.1:26761 at a fixed 200 Hz, the same
+Reads the iio-dsu-bridge stream used by Cemu (127.0.0.1:26760), rescales the gyro for Eden's DSU client
+(Eden divides by 312 instead of 360) and republishes it on 127.0.0.1:26761 at a fixed 200 Hz, the same
 rate Eden samples motion for the game (src/hid_core/resources/six_axis/six_axis.cpp). Only one process
 reads the IMU, and the game sees each sample once.
 
-Tested on ROG Ally X (BMI323) with the official iio-dsu-bridge rog-ally.yaml
-(mount_matrix x[1,0,0] y[0,-1,0] z[0,0,-1]). Other devices or configs need a different conversion.
+Tested on ROG Ally X (BMI323) with the bridge config from iio-dsu-bridge issue #15
+(accel_matrix x[-1,0,0] y[0,0,1] z[0,-1,0], gyro_matrix x[1,0,0] y[0,0,1] z[0,-1,0]), which is correct for both
+Cemu and Eden. The relay only rescales the gyro for Eden and resamples to 200 Hz.
 
 Usage:
   dsu-relay                 run the relay
@@ -29,12 +30,11 @@ MSG_INFO = 0x00100001
 MSG_DATA = 0x00100002
 MAC = bytes([0x02, 0x20, 0x6A, 0x7E, 0x51, 0x01])
 
-# Cemu bridge: mount_matrix x[1,0,0] y[0,-1,0] z[0,0,-1] on both sensors.
-# Frame verified for Eden: accel diag(-1,1,1), gyro 0.866667*I (0.866667 = 312/360 undoes Eden's 1/312 gyro scale).
-# So accel_eden = diag(-1,-1,-1) * accel_cemu and gyro_eden = 0.866667 * diag(1,-1,-1) * gyro_cemu.
+# The bridge already sends the frame both emulators expect, so the axes pass through unchanged.
+# Eden divides DSU gyro values by 312 instead of 360: 0.866667 = 312/360 undoes that.
 GYRO_SCALE = 0.866667
-ACCEL_MATRIX = ((-1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
-GYRO_MATRIX = ((GYRO_SCALE, 0.0, 0.0), (0.0, -GYRO_SCALE, 0.0), (0.0, 0.0, -GYRO_SCALE))
+ACCEL_MATRIX = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+GYRO_MATRIX = ((GYRO_SCALE, 0.0, 0.0), (0.0, GYRO_SCALE, 0.0), (0.0, 0.0, GYRO_SCALE))
 
 STALE_SECONDS = 0.1       # stop sending if the bridge has been silent this long
 SUB_TIMEOUT_SECONDS = 10  # Eden renews its subscription every 3 s

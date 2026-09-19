@@ -13,18 +13,21 @@ at the same time, keeping Xbox-style glyphs, Steam Input and the default InputPl
   rotated accelerometer and the DualSense target has a fake sensor timestamp and a bad calibration report
   (InputPlumber issue: https://github.com/ShadowBlip/InputPlumber/issues/715). With Steam Input on, Eden only sees Steam's virtual pad, which has no sensors.
 - [iio-dsu-bridge](https://github.com/Sebalvarez97/iio-dsu-bridge) reads the IMU directly and serves it over
-  cemuhook/DSU. Cemu and Eden need different axis conventions, but running a second bridge halves the sample rate
-  (both poll the same sensor), and at ~120 Hz Eden's motion steering gets stuck on one side.
-- **Fix:** one bridge for Cemu on port 26760, plus a tiny relay that converts the axes for Eden and republishes on
-  port 26761 at a fixed 200 Hz, the rate Eden samples motion for the game.
+  cemuhook/DSU. The official `rog-ally.yaml` frame is wrong for tilt: Cemu and Eden read a sideways tilt as a
+  horizontal rotation (motion shrines rotate instead of tilting, steering gets stuck). The matrices from
+  [iio-dsu-bridge issue #15](https://github.com/Sebalvarez97/iio-dsu-bridge/issues/15) fix it for both emulators.
+- Eden still needs two things: its DSU gyro is divided by 312 instead of 360, and it samples motion at a fixed
+  200 Hz, so a slower or irregular stream makes the steering stick.
+- **Fix:** one bridge on port 26760 with the issue #15 matrices (used by Cemu), plus a tiny relay that rescales the
+  gyro for Eden and republishes on port 26761 at a fixed 200 Hz.
 
 ```
 BMI323 --> iio-dsu-bridge :26760 --> Cemu
                    |
-                   +--> dsu-relay :26761 (axes for Eden, 200 Hz) --> Eden
+                   +--> dsu-relay :26761 (gyro x 312/360, 200 Hz) --> Eden
 ```
 
-## 1. iio-dsu-bridge (Cemu)
+## 1. iio-dsu-bridge
 
 Install it with the official ROG Ally config, following its README:
 
@@ -32,13 +35,23 @@ Install it with the official ROG Ally config, following its README:
 bash <(curl -fsSL https://github.com/Sebalvarez97/iio-dsu-bridge/releases/latest/download/install.sh)
 ```
 
-The relay expects exactly this config in `~/.config/iio-dsu-bridge.yaml`:
+Then replace its config with the matrices from
+[issue #15](https://github.com/Sebalvarez97/iio-dsu-bridge/issues/15), which are correct for both Cemu and Eden, and
+restart the bridge:
 
-```yaml
-mount_matrix:
+```bash
+cat > ~/.config/iio-dsu-bridge.yaml <<'EOF'
+accel_matrix:
+  x: [-1, 0, 0]
+  y: [0, 0, 1]
+  z: [0, -1, 0]
+
+gyro_matrix:
   x: [1, 0, 0]
-  y: [0, -1, 0]
-  z: [0, 0, -1]
+  y: [0, 0, 1]
+  z: [0, -1, 0]
+EOF
+systemctl --user restart iio-dsu-bridge
 ```
 
 In Cemu's input settings, add the motion source as a DSU (cemuhook) controller at `127.0.0.1:26760`.
@@ -103,9 +116,10 @@ You should see about `from bridge 180/s, sent 200/s, subscribers 1`.
 
 ## Other devices
 
-The relay converts from the iio-dsu-bridge `rog-ally.yaml` frame to the frame verified for Eden on the Ally X:
-`accel_eden = -accel`, `gyro_eden = 0.866667 * (pitch, -yaw, -roll)`. Another device or config needs another
-conversion (`ACCEL_MATRIX`/`GYRO_MATRIX` at the top of `dsu-relay`). If you work one out, please share it.
+The bridge matrices above were verified on the Ally X: bow aiming and the Myahm Agana tilt maze in Cemu, and
+Mario Kart 8 Deluxe steering in Eden. Another device needs its own `accel_matrix`/`gyro_matrix` in the bridge
+config; the relay does not touch the axes, it only rescales the gyro for Eden (`GYRO_SCALE`). If you work out the
+matrices for another device, please share them.
 
 ## Uninstall
 
