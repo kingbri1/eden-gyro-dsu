@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""DSU (cemuhook) relay for Eden.
+"""DSU (cemuhook) relay for Cemu and Eden on a handheld.
 
-Reads the iio-dsu-bridge stream used by Cemu (127.0.0.1:26760), rescales the gyro for Eden's DSU client
-(Eden divides by 312 instead of 360) and republishes it on 127.0.0.1:26761 at a fixed 200 Hz, the same
-rate Eden samples motion for the game (src/hid_core/resources/six_axis/six_axis.cpp). Only one process
-reads the IMU, and the game sees each sample once.
+Publishes one DSU server on 127.0.0.1:26761 with four slots at a fixed 200 Hz:
+
+  slot 1 (index 0): main pad, gyro in real deg/s   -> Cemu
+  slot 2 (index 1): main pad, gyro x 312/360       -> Eden player 1
+  slot 3 (index 2): second pad, gyro x 312/360     -> Eden player 2
+  slot 4 (index 3): third pad, gyro x 312/360      -> Eden player 3
+
+(Eden divides DSU gyro values by 312 instead of 360, hence the factor on its slots.)
+
+The motion sources are picked automatically:
+
+  * every connected DualSense / DualSense Edge (kernel hid-playstation "Motion Sensors" nodes),
+    in the order they connect: first pad = main pad,
+  * the handheld IMU served by iio-dsu-bridge on 127.0.0.1:26760, used as the main pad when no
+    DualSense is connected.
+
+So docking the handheld and turning on one or more DualSense pads switches the motion sources with no
+config change in the emulators, and turning them off switches back to the handheld IMU.
 
 Tested on ROG Ally X (BMI323) with the bridge config from iio-dsu-bridge issue #15
-(accel_matrix x[-1,0,0] y[0,0,1] z[0,-1,0], gyro_matrix x[1,0,0] y[0,0,1] z[0,-1,0]), which is correct for both
-Cemu and Eden. The relay only rescales the gyro for Eden and resamples to 200 Hz.
+(accel_matrix x[-1,0,0] y[0,0,1] z[0,-1,0], gyro_matrix x[1,0,0] y[0,0,1] z[0,-1,0]).
 
 Usage:
   dsu-relay                 run the relay
-  dsu-relay --check 15      compare 26760 with another DSU server on 26761 and estimate the matrix
+  dsu-relay --sources 20    print the motion sources and their slots (to check poses and pad order)
 """
 import argparse
+import glob
+import os
 import random
 import select
 import socket
@@ -30,19 +45,23 @@ MSG_INFO = 0x00100001
 MSG_DATA = 0x00100002
 MAC = bytes([0x02, 0x20, 0x6A, 0x7E, 0x51, 0x01])
 
-# The bridge already sends the frame both emulators expect, so the axes pass through unchanged.
-# Eden divides DSU gyro values by 312 instead of 360: 0.866667 = 312/360 undoes that.
-GYRO_SCALE = 0.866667
-ACCEL_MATRIX = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-GYRO_MATRIX = ((GYRO_SCALE, 0.0, 0.0), (0.0, GYRO_SCALE, 0.0), (0.0, 0.0, GYRO_SCALE))
+SLOT_CEMU = 0             # main pad, gyro in deg/s, as Cemu expects
+SLOT_EDEN_P1 = 1          # main pad, scaled for Eden
+SLOT_EDEN_P2 = 2          # second pad
+SLOT_EDEN_P3 = 3          # third pad
+SLOTS = (SLOT_CEMU, SLOT_EDEN_P1, SLOT_EDEN_P2, SLOT_EDEN_P3)
+GYRO_SCALE = 312.0 / 360.0
 
-STALE_SECONDS = 0.1       # stop sending if the bridge has been silent this long
+STALE_SECONDS = 0.2       # a source is "live" only while it produced samples this recently
 SUB_TIMEOUT_SECONDS = 10  # Eden renews its subscription every 3 s
+SCAN_SECONDS = 2.0        # how often to look for new DualSense pads
 LOG_EVERY_SECONDS = 60
 
-
-def apply(m, v):
-    return tuple(m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] for i in range(3))
+# DualSense motion sensors, as exposed by the kernel hid-playstation driver
+DS_ACC_RES_PER_G = 8192.0
+DS_GYRO_RES_PER_DEG_S = 1024.0
+EV_SYN, EV_ABS = 0, 3
+EVENT = struct.Struct("=qqHHi")
 
 
 def finish_packet(buf):
@@ -64,17 +83,17 @@ def build_version(server_id):
 
 
 def shared_beginning(slot, state):
-    return bytes([slot, state, 2, 1]) + MAC + bytes([0x05])
+    return bytes([slot, state, 2, 1]) + bytes([MAC[0] + slot]) + MAC[1:] + bytes([0x05])
 
 
 def build_info(server_id, slot, state):
     return build_packet(server_id, MSG_INFO, shared_beginning(slot, state) + bytes([1 if state == 2 else 0]))
 
 
-def build_data(server_id, counter, timestamp_us, accel, gyro):
+def build_data(server_id, slot, counter, timestamp_us, accel, gyro):
     """Same layout as buildControllerData in iio-dsu-bridge."""
     p = bytearray(80)
-    p[0:11] = shared_beginning(0, 2)
+    p[0:11] = shared_beginning(slot, 2)
     p[11] = 1
     struct.pack_into("<I", p, 12, counter & 0xFFFFFFFF)
     p[20:24] = bytes([128] * 4)
@@ -91,56 +110,220 @@ def build_subscribe(client_id):
 
 
 def parse_data(packet):
-    """(counter, accel_g, gyro_dps) from a DSU pad data packet, or None."""
+    """(slot, counter, accel_g, gyro_dps) from a DSU pad data packet, or None."""
     if len(packet) < 100 or packet[:4] != b"DSUS" or struct.unpack_from("<I", packet, 16)[0] != MSG_DATA:
         return None
-    return (struct.unpack_from("<I", packet, 32)[0],
+    return (packet[20],
+            struct.unpack_from("<I", packet, 32)[0],
             struct.unpack_from("<3f", packet, 76),
             struct.unpack_from("<3f", packet, 88))
 
 
+class BridgeSource:
+    """The handheld IMU, read from iio-dsu-bridge over DSU."""
+
+    name = "handheld IMU (bridge)"
+
+    def __init__(self, host="127.0.0.1", port=26760):
+        self.address = (host, port)
+        self.latest = None  # (arrival time, accel_g, gyro_dps)
+        self.samples = 0
+
+    def run(self, stop):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(0.2)
+        subscribe = build_subscribe(random.getrandbits(32))
+        last_subscribe = 0.0
+        try:
+            while not stop.is_set():
+                now = time.monotonic()
+                if now - last_subscribe >= 1.0:
+                    try:
+                        sock.sendto(subscribe, self.address)
+                    except OSError:
+                        pass
+                    last_subscribe = now
+                try:
+                    data, _ = sock.recvfrom(2048)
+                except OSError:  # timeout, or port closed while the bridge restarts
+                    continue
+                parsed = parse_data(data)
+                if parsed:
+                    _, _, accel, gyro = parsed
+                    self.latest = (time.monotonic(), accel, gyro)
+                    self.samples += 1
+        finally:
+            sock.close()
+
+
+def ds_to_dsu(values, res):
+    """One DualSense report to the DSU convention used by the bridge.
+
+    Accel is negated and the gyro keeps x while y and z flip, which is what Cemu's DSU path
+    expects (it feeds its fusion with (a.x, -a.y, -a.z)).
+    """
+    accel = tuple(-values[i] / res[i] for i in range(3))
+    gyro = (values[3] / res[3], -values[4] / res[4], -values[5] / res[5])
+    return accel, gyro
+
+
+class DualSensePad:
+    """One DualSense, read from its kernel 'Motion Sensors' evdev node."""
+
+    def __init__(self, path, uniq, name):
+        self.path = path
+        self.uniq = uniq
+        self.name = f"DualSense {uniq}" if uniq else "DualSense"
+        self.full_name = name
+        self.latest = None
+        self.samples = 0
+
+    @staticmethod
+    def resolutions(fd):
+        try:
+            import fcntl
+        except ImportError:
+            return [DS_ACC_RES_PER_G] * 3 + [DS_GYRO_RES_PER_DEG_S] * 3
+        out = []
+        for code in range(6):
+            default = DS_ACC_RES_PER_G if code < 3 else DS_GYRO_RES_PER_DEG_S
+            buf = bytearray(24)
+            try:
+                fcntl.ioctl(fd, 0x80184540 + code, buf)
+                res = struct.unpack("6i", buf)[5]
+                out.append(float(res) if res > 0 else default)
+            except OSError:
+                out.append(default)
+        return out
+
+    def run(self, stop):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        res = self.resolutions(fd)
+        values = [0] * 6
+        pending = b""
+        try:
+            while not stop.is_set():
+                if not select.select([fd], [], [], 0.2)[0]:
+                    continue
+                chunk = os.read(fd, EVENT.size * 64)
+                if not chunk:
+                    break
+                pending += chunk
+                while len(pending) >= EVENT.size:
+                    _, _, etype, code, value = EVENT.unpack_from(pending)
+                    pending = pending[EVENT.size:]
+                    if etype == EV_ABS and code < 6:
+                        values[code] = value
+                    elif etype == EV_SYN and code == 0:
+                        accel, gyro = ds_to_dsu(values, res)
+                        self.latest = (time.monotonic(), accel, gyro)
+                        self.samples += 1
+        except OSError:  # unplugged
+            pass
+        finally:
+            os.close(fd)
+            self.latest = None
+
+
+class DualSenseManager:
+    """Keeps one reader per connected DualSense, in the order the pads connect."""
+
+    def __init__(self):
+        self.pads = []  # ordered: first connected first
+        self.lock = threading.Lock()
+        self.samples = 0
+
+    @staticmethod
+    def find_nodes():
+        found = []
+        for name_file in sorted(glob.glob("/sys/class/input/event*/device/name")):
+            try:
+                name = open(name_file).read().strip()
+            except OSError:
+                continue
+            if "Motion Sensors" not in name or "DualSense" not in name:
+                continue
+            device_dir = os.path.dirname(name_file)
+            try:
+                uniq = open(os.path.join(device_dir, "uniq")).read().strip()
+            except OSError:
+                uniq = ""
+            found.append(("/dev/input/" + name_file.split("/")[4], uniq, name))
+        return found
+
+    def live(self, now):
+        with self.lock:
+            pads = list(self.pads)
+        return [p for p in pads if p.latest and now - p.latest[0] <= STALE_SECONDS]
+
+    def run(self, stop):
+        threads = {}
+        while not stop.is_set():
+            paths = {path: (uniq, name) for path, uniq, name in self.find_nodes()}
+            with self.lock:
+                known = {pad.path for pad in self.pads}
+                for path, (uniq, name) in paths.items():
+                    if path in known:
+                        continue
+                    pad = DualSensePad(path, uniq, name)
+                    self.pads.append(pad)
+                    thread = threading.Thread(target=pad.run, args=(stop,), daemon=True)
+                    thread.start()
+                    threads[path] = thread
+                gone = [pad for pad in self.pads if pad.path not in paths]
+                for pad in gone:
+                    self.samples += pad.samples
+                    self.pads.remove(pad)
+                    threads.pop(pad.path, None)
+            stop.wait(SCAN_SECONDS)
+
+    def total_samples(self):
+        with self.lock:
+            return self.samples + sum(pad.samples for pad in self.pads)
+
+
 class Relay:
-    def __init__(self, upstream_port=26760, listen_port=26761, rate=200.0, host="127.0.0.1", log=print):
-        self.upstream = (host, upstream_port)
+    def __init__(self, listen_port=26761, rate=200.0, host="127.0.0.1", log=print,
+                 bridge=None, dualsense=None):
         self.rate = rate
         self.log = log
         self.server_id = random.getrandbits(32)
-        self.up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.up.bind((host, 0))
-        self.up.settimeout(0.2)
+        self.bridge = bridge if bridge is not None else BridgeSource(host)
+        self.dualsense = dualsense if dualsense is not None else DualSenseManager()
         self.down = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.down.bind((host, listen_port))
         self.down.settimeout(0.2)
         self.listen_port = self.down.getsockname()[1]
         self.lock = threading.Lock()
-        self.latest = None  # (arrival time, accel, gyro) in Eden's frame
-        self.subs = {}      # address -> [last renewal, counter]
+        self.subs = {}  # address -> [last renewal, {slot: counter}]
         self.stop = threading.Event()
-        self.stats = {"upstream": 0, "sent": 0}
+        self.stats = {"sent": 0}
+        self.layout = ""
+        self.active_slots = set()
         self.threads = []
 
-    def _upstream_loop(self):
-        subscribe = build_subscribe(random.getrandbits(32))
-        last_subscribe = 0.0
-        while not self.stop.is_set():
-            now = time.monotonic()
-            if now - last_subscribe >= 1.0:
-                try:
-                    self.up.sendto(subscribe, self.upstream)
-                except OSError:
-                    pass
-                last_subscribe = now
-            try:
-                data, _ = self.up.recvfrom(2048)
-            except OSError:  # timeout, or port closed while the bridge restarts
-                continue
-            parsed = parse_data(data)
-            if parsed:
-                _, accel, gyro = parsed
-                sample = (time.monotonic(), apply(ACCEL_MATRIX, accel), apply(GYRO_MATRIX, gyro))
-                with self.lock:
-                    self.latest = sample
-                    self.stats["upstream"] += 1
+    def slot_sources(self, now):
+        """{slot: (source, accel, gyro)} for the slots that currently have motion data."""
+        pads = self.dualsense.live(now)
+        main = pads[0] if pads else None
+        if main is None:
+            sample = self.bridge.latest
+            if sample and now - sample[0] <= STALE_SECONDS:
+                main = self.bridge
+        out = {}
+        if main is not None:
+            accel, gyro = main.latest[1], main.latest[2]
+            out[SLOT_CEMU] = (main, accel, gyro)
+            out[SLOT_EDEN_P1] = (main, accel, tuple(g * GYRO_SCALE for g in gyro))
+        for index, slot in enumerate((SLOT_EDEN_P2, SLOT_EDEN_P3), start=1):
+            if len(pads) > index:
+                pad = pads[index]
+                out[slot] = (pad, pad.latest[1], tuple(g * GYRO_SCALE for g in pad.latest[2]))
+        return out
 
     def _downstream_loop(self):
         while not self.stop.is_set():
@@ -151,19 +334,25 @@ class Relay:
             if len(data) < 20 or data[:4] != b"DSUC" or struct.unpack_from("<H", data, 4)[0] != PROTO_VERSION:
                 continue
             msg = struct.unpack_from("<I", data, 16)[0]
+            active = set(self.active_slots)
             replies = []
             if msg in (MSG_VERSION, MSG_INFO, MSG_DATA):
                 replies.append(build_version(self.server_id))
             if msg == MSG_INFO and len(data) >= 24:
                 count = max(0, min(struct.unpack_from("<i", data, 20)[0], 4))
                 for slot in data[24:24 + count]:
-                    replies.append(build_info(self.server_id, slot, 2 if slot == 0 else 0))
+                    replies.append(build_info(self.server_id, slot, 2 if slot in active else 0))
             elif msg == MSG_DATA and len(data) >= 28:
                 flags, slot = data[20], data[21]
-                if flags == 0 or (flags & 0x01 and slot == 0):
+                wanted = set(SLOTS) if flags == 0 else ({slot} & set(SLOTS) if flags & 0x01 else set())
+                if wanted:
                     with self.lock:
-                        self.subs.setdefault(addr, [0.0, 0])[0] = time.monotonic()
-                    replies.append(build_info(self.server_id, 0, 2))
+                        entry = self.subs.setdefault(addr, [0.0, {}])
+                        entry[0] = time.monotonic()
+                        for s in wanted:
+                            entry[1].setdefault(s, 0)
+                    for s in sorted(wanted & active):
+                        replies.append(build_info(self.server_id, s, 2))
             for reply in replies:
                 try:
                     self.down.sendto(reply, addr)
@@ -182,33 +371,47 @@ class Relay:
             next_tick += period
             if now - next_tick > 0.05:  # fell behind (e.g. suspend): restart the schedule from now
                 next_tick = now + period
+
+            sources = self.slot_sources(now)
+            self.active_slots = set(sources)
+            layout = ", ".join(f"slot {slot + 1}: {src.name}" for slot, (src, _, _) in sorted(sources.items()))
+            if layout != self.layout:
+                self.log(f"motion sources -> {layout or 'none'}")
+                self.layout = layout
+
             with self.lock:
                 for addr in [a for a, e in self.subs.items() if now - e[0] > SUB_TIMEOUT_SECONDS]:
                     del self.subs[addr]
-                sample = self.latest
                 targets = []
-                if sample and now - sample[0] <= STALE_SECONDS:
-                    for addr, entry in self.subs.items():
-                        entry[1] += 1
-                        targets.append((addr, entry[1]))
+                for addr, entry in self.subs.items():
+                    for slot in sorted(entry[1]):
+                        if slot in sources:
+                            entry[1][slot] += 1
+                            targets.append((addr, slot, entry[1][slot]))
                 infos = list(self.subs) if now - last_info >= 0.5 else []
             if infos:
                 last_info = now
+
             timestamp_us = int(now * 1_000_000)
-            for addr, counter in targets:
+            for addr, slot, counter in targets:
+                _, accel, gyro = sources[slot]
                 try:
-                    self.down.sendto(build_data(self.server_id, counter, timestamp_us, sample[1], sample[2]), addr)
+                    self.down.sendto(build_data(self.server_id, slot, counter, timestamp_us, accel, gyro), addr)
                     self.stats["sent"] += 1
                 except OSError:
                     pass
             for addr in infos:
-                try:
-                    self.down.sendto(build_info(self.server_id, 0, 2), addr)
-                except OSError:
-                    pass
+                for slot in sorted(sources):
+                    try:
+                        self.down.sendto(build_info(self.server_id, slot, 2), addr)
+                    except OSError:
+                        pass
 
     def start(self):
-        for target in (self._upstream_loop, self._downstream_loop, self._emit_loop):
+        for target in (lambda: self.bridge.run(self.stop),
+                       lambda: self.dualsense.run(self.stop),
+                       self._downstream_loop,
+                       self._emit_loop):
             thread = threading.Thread(target=target, daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -217,14 +420,14 @@ class Relay:
         self.stop.set()
         for thread in self.threads:
             thread.join(timeout=1)
-        self.up.close()
         self.down.close()
 
     def run(self, seconds=0):
         self.start()
-        self.log(f"DSU relay: {self.upstream[0]}:{self.upstream[1]} -> {self.upstream[0]}:{self.listen_port} at {self.rate:g} Hz")
+        self.log(f"DSU relay on 127.0.0.1:{self.listen_port} at {self.rate:g} Hz "
+                 f"(slot 1 = Cemu, slots 2-4 = Eden players 1-3)")
         start = last_log = time.monotonic()
-        last_stats = dict(self.stats)
+        last = dict(self.stats, bridge=self.bridge.samples, dualsense=self.dualsense.total_samples())
         try:
             while not seconds or time.monotonic() - start < seconds:
                 time.sleep(0.2)
@@ -233,9 +436,12 @@ class Relay:
                     window = now - last_log
                     with self.lock:
                         subs = len(self.subs)
-                    self.log(f"from bridge {(self.stats['upstream'] - last_stats['upstream']) / window:.0f}/s, "
-                             f"sent {(self.stats['sent'] - last_stats['sent']) / window:.0f}/s, subscribers {subs}")
-                    last_stats = dict(self.stats)
+                    dualsense = self.dualsense.total_samples()
+                    self.log(f"{self.layout or 'no source'} | bridge "
+                             f"{(self.bridge.samples - last['bridge']) / window:.0f}/s, pads "
+                             f"{(dualsense - last['dualsense']) / window:.0f}/s, sent "
+                             f"{(self.stats['sent'] - last['sent']) / window:.0f}/s, subscribers {subs}")
+                    last = dict(self.stats, bridge=self.bridge.samples, dualsense=dualsense)
                     last_log = now
         except KeyboardInterrupt:
             pass
@@ -243,108 +449,54 @@ class Relay:
             self.close()
 
 
-def invert3(m):
-    a, b, c = m[0]
-    d, e, f = m[1]
-    g, h, i = m[2]
-    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-    scale = ((a + e + i) / 3.0) ** 3
-    if scale <= 0 or det <= 0.01 * scale:
-        return None
-    return [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
-            [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
-            [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
-
-
-def fit_matrix(pairs):
-    """Least squares: the matrix M such that output ~= M * input, from (output, input) pairs."""
-    cc = [[0.0] * 3 for _ in range(3)]
-    ec = [[0.0] * 3 for _ in range(3)]
-    for out, inp in pairs:
-        for i in range(3):
-            for j in range(3):
-                cc[i][j] += inp[i] * inp[j]
-                ec[i][j] += out[i] * inp[j]
-    inv = invert3(cc)
-    if inv is None:
-        return None
-    return [[sum(ec[i][k] * inv[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
-
-
-def check(seconds, cemu_port=26760, eden_port=26761, host="127.0.0.1", log=print):
-    """Compare two DSU servers and estimate the matrix from the first to the second. True if it matches the relay's."""
-    socks = {}
-    for name, port in (("cemu", cemu_port), ("eden", eden_port)):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind((host, 0))
-        s.setblocking(False)
-        socks[name] = (s, (host, port))
-    subscribe = build_subscribe(random.getrandbits(32))
-    accel_pairs, gyro_pairs = [], []
-    latest_cemu = None
-    start = time.monotonic()
-    last_subscribe = 0.0
-    log(f"Comparing for {seconds:g} s: slowly rotate the device in every direction.")
+def show_sources(seconds, log=print):
+    """Print every motion source with its slot, once per second."""
+    stop = threading.Event()
+    bridge, pads = BridgeSource(), DualSenseManager()
+    threads = [threading.Thread(target=s.run, args=(stop,), daemon=True) for s in (bridge, pads)]
+    for thread in threads:
+        thread.start()
+    log("slot | source                  | accel g            | gyro deg/s")
+    end = time.monotonic() + seconds
     try:
-        while time.monotonic() - start < seconds:
+        while time.monotonic() < end:
+            time.sleep(1.0)
             now = time.monotonic()
-            if now - last_subscribe >= 1.0:
-                for s, addr in socks.values():
-                    try:
-                        s.sendto(subscribe, addr)
-                    except OSError:
-                        pass
-                last_subscribe = now
-            ready, _, _ = select.select([s for s, _ in socks.values()], [], [], 0.1)
-            for s in ready:
-                try:
-                    data, _ = s.recvfrom(2048)
-                except OSError:
-                    continue
-                parsed = parse_data(data)
-                if not parsed:
-                    continue
-                arrived = time.monotonic()
-                if s is socks["cemu"][0]:
-                    latest_cemu = (arrived, parsed[1], parsed[2])
-                elif latest_cemu and arrived - latest_cemu[0] < 0.02:
-                    accel_pairs.append((parsed[1], latest_cemu[1]))
-                    gyro_pairs.append((parsed[2], latest_cemu[2]))
+            live = pads.live(now)
+            if not live:
+                sample = bridge.latest
+                rows = [("1+2", bridge.name, sample)] if sample and now - sample[0] <= STALE_SECONDS else []
+            else:
+                rows = [("1+2", live[0].name, live[0].latest)]
+                for index, pad in enumerate(live[1:3], start=3):
+                    rows.append((str(index), pad.name, pad.latest))
+            if not rows:
+                log("no motion source")
+            for slot, name, sample in rows:
+                _, accel, gyro = sample
+                log(f"{slot:4} | {name:23} | {accel[0]:6.2f} {accel[1]:6.2f} {accel[2]:6.2f} |"
+                    f" {gyro[0]:7.1f} {gyro[1]:7.1f} {gyro[2]:7.1f}")
+            log("")
+    except KeyboardInterrupt:
+        pass
     finally:
-        for s, _ in socks.values():
-            s.close()
-
-    log(f"Sample pairs: {len(accel_pairs)}")
-    if len(accel_pairs) < 300:
-        log("RESULT: not enough data. Make sure both DSU servers are running.")
-        return False
-    ok = True
-    for label, pairs, expected, tolerance in (("accelerometer", accel_pairs, ACCEL_MATRIX, 0.1),
-                                              ("gyroscope", gyro_pairs, GYRO_MATRIX, 0.15)):
-        fitted = fit_matrix(pairs)
-        if fitted is None:
-            log(f"{label}: not enough motion to estimate the matrix, repeat rotating around every axis.")
-            ok = False
-            continue
-        worst = max(abs(fitted[i][j] - expected[i][j]) for i in range(3) for j in range(3))
-        log(f"{label}: estimated {[[round(v, 2) for v in row] for row in fitted]}")
-        log(f"{label}: expected  {[[round(v, 2) for v in row] for row in expected]}  max error {worst:.3f}")
-        ok = ok and worst < tolerance
-    log("RESULT: " + ("OK, the relay conversion matches." if ok else "does NOT match."))
-    return ok
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=1)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--upstream-port", type=int, default=26760)
     parser.add_argument("--listen-port", type=int, default=26761)
     parser.add_argument("--rate", type=float, default=200.0)
-    parser.add_argument("--check", type=float, metavar="SECONDS", help="compare the two ports instead of running the relay")
+    parser.add_argument("--sources", type=float, metavar="SECONDS",
+                        help="print the motion sources and their slots instead of running the relay")
     args = parser.parse_args()
     log = lambda text: print(text, flush=True)
-    if args.check:
-        raise SystemExit(0 if check(args.check, args.upstream_port, args.listen_port, log=log) else 1)
-    Relay(args.upstream_port, args.listen_port, args.rate, log=log).run()
+    if args.sources:
+        show_sources(args.sources, log=log)
+        return
+    Relay(args.listen_port, args.rate, log=log).run()
 
 
 if __name__ == "__main__":
