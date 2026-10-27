@@ -13,15 +13,19 @@ Publishes one DSU server on 127.0.0.1:26761 with four slots at a fixed 200 Hz:
 
 The motion sources are picked automatically:
 
-  * every connected DualSense / DualSense Edge (kernel hid-playstation "Motion Sensors" nodes),
+  * every connected real DualSense / DualSense Edge (kernel hid-playstation "Motion Sensors" nodes),
     in the order they connect: first pad = main pad,
-  * the handheld IMU served by iio-dsu-bridge on 127.0.0.1:26760, used as the main pad when no
-    DualSense is connected.
+  * otherwise the handheld IMU, from whichever of these is available:
+      - InputPlumber's virtual DualSense (target "DualSense Edge", InputPlumber 0.82 or later), which
+        on the ROG Ally X reports a frame rotated 180 degrees about X compared with a real DualSense
+        and is corrected here,
+      - iio-dsu-bridge on 127.0.0.1:26760 (InputPlumber 0.81 or earlier, which leaves the IMU free).
 
 So docking the handheld and turning on one or more DualSense pads switches the motion sources with no
 config change in the emulators, and turning them off switches back to the handheld IMU.
 
-Tested on ROG Ally X (BMI323) with the bridge config from iio-dsu-bridge issue #15
+Tested on ROG Ally X (BMI323): with InputPlumber 0.83 and the DualSense Edge target, and with
+InputPlumber 0.81 plus the bridge config from iio-dsu-bridge issue #15
 (accel_matrix x[-1,0,0] y[0,0,1] z[0,-1,0], gyro_matrix x[1,0,0] y[0,0,1] z[0,-1,0]).
 
 Usage:
@@ -168,13 +172,32 @@ def ds_to_dsu(values, res):
     return accel, gyro
 
 
+def flip_virtual(accel, gyro):
+    """InputPlumber's virtual DualSense on the ROG Ally X, rotated 180 degrees about X to match a real pad.
+
+    Measured: lying flat it reads Y +1 g and screen-up-vertical Z -1 g after ds_to_dsu, where a real
+    DualSense and the bridge read Y -1 g and Z +1 g; X matches. A proper rotation, so the gyro gets the
+    same correction.
+    """
+    return (accel[0], -accel[1], -accel[2]), (gyro[0], -gyro[1], -gyro[2])
+
+
+def is_virtual_device(device_dir):
+    """True for uhid devices (InputPlumber targets), False for real pads on USB or Bluetooth."""
+    return "/devices/virtual/" in os.path.realpath(device_dir)
+
+
 class DualSensePad:
     """One DualSense, read from its kernel 'Motion Sensors' evdev node."""
 
-    def __init__(self, path, uniq, name):
+    def __init__(self, path, uniq, name, virtual=False):
         self.path = path
         self.uniq = uniq
-        self.name = f"DualSense {uniq}" if uniq else "DualSense"
+        self.virtual = virtual
+        if virtual:
+            self.name = "handheld IMU (InputPlumber)"
+        else:
+            self.name = f"DualSense {uniq}" if uniq else "DualSense"
         self.full_name = name
         self.latest = None
         self.samples = 0
@@ -220,6 +243,8 @@ class DualSensePad:
                         values[code] = value
                     elif etype == EV_SYN and code == 0:
                         accel, gyro = ds_to_dsu(values, res)
+                        if self.virtual:
+                            accel, gyro = flip_virtual(accel, gyro)
                         self.latest = (time.monotonic(), accel, gyro)
                         self.samples += 1
         except OSError:  # unplugged
@@ -230,7 +255,11 @@ class DualSensePad:
 
 
 class DualSenseManager:
-    """Keeps one reader per connected DualSense, in the order the pads connect."""
+    """Keeps one reader per connected DualSense, in the order the pads connect.
+
+    Real pads always come first; InputPlumber's virtual pad (the handheld IMU) is used only when no
+    real pad is sending.
+    """
 
     def __init__(self):
         self.pads = []  # ordered: first connected first
@@ -252,24 +281,26 @@ class DualSenseManager:
                 uniq = open(os.path.join(device_dir, "uniq")).read().strip()
             except OSError:
                 uniq = ""
-            found.append(("/dev/input/" + name_file.split("/")[4], uniq, name))
+            found.append(("/dev/input/" + name_file.split("/")[4], uniq, name, is_virtual_device(device_dir)))
         return found
 
     def live(self, now):
         with self.lock:
             pads = list(self.pads)
-        return [p for p in pads if p.latest and now - p.latest[0] <= STALE_SECONDS]
+        fresh = [p for p in pads if p.latest and now - p.latest[0] <= STALE_SECONDS]
+        real = [p for p in fresh if not getattr(p, "virtual", False)]
+        return real or [p for p in fresh if getattr(p, "virtual", False)][:1]
 
     def run(self, stop):
         threads = {}
         while not stop.is_set():
-            paths = {path: (uniq, name) for path, uniq, name in self.find_nodes()}
+            paths = {path: (uniq, name, virtual) for path, uniq, name, virtual in self.find_nodes()}
             with self.lock:
                 known = {pad.path for pad in self.pads}
-                for path, (uniq, name) in paths.items():
+                for path, (uniq, name, virtual) in paths.items():
                     if path in known:
                         continue
-                    pad = DualSensePad(path, uniq, name)
+                    pad = DualSensePad(path, uniq, name, virtual)
                     self.pads.append(pad)
                     thread = threading.Thread(target=pad.run, args=(stop,), daemon=True)
                     thread.start()
