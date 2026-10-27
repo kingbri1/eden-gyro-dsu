@@ -317,6 +317,15 @@ class DualSenseManager:
             return self.samples + sum(pad.samples for pad in self.pads)
 
 
+class _Hold:
+    """Placeholder source while nothing is live: slots 1 and 2 keep sending a device at rest."""
+
+    name = "none (holding still)"
+
+
+HOLD = _Hold()
+
+
 class Relay:
     def __init__(self, listen_port=26761, rate=200.0, host="127.0.0.1", log=print,
                  bridge=None, dualsense=None):
@@ -335,10 +344,16 @@ class Relay:
         self.stats = {"sent": 0}
         self.layout = ""
         self.active_slots = set()
+        self.last_accel = (0.0, -1.0, 0.0)  # lying flat, until a source reports
         self.threads = []
 
     def slot_sources(self, now):
-        """{slot: (source, accel, gyro)} for the slots that currently have motion data."""
+        """{slot: (source, accel, gyro)} for the slots that currently have motion data.
+
+        Slots 1 and 2 never go silent: while no source is live (InputPlumber recreates its virtual pad
+        when a game starts, which takes a few seconds), they hold the last attitude with the gyro at
+        rest. Cemu only asks for more data after it receives some, so a gap would drop it for good.
+        """
         pads = self.dualsense.live(now)
         main = pads[0] if pads else None
         if main is None:
@@ -348,8 +363,12 @@ class Relay:
         out = {}
         if main is not None:
             accel, gyro = main.latest[1], main.latest[2]
+            self.last_accel = accel
             out[SLOT_CEMU] = (main, accel, gyro)
             out[SLOT_EDEN_P1] = (main, accel, tuple(g * GYRO_SCALE for g in gyro))
+        else:
+            out[SLOT_CEMU] = (HOLD, self.last_accel, (0.0, 0.0, 0.0))
+            out[SLOT_EDEN_P1] = (HOLD, self.last_accel, (0.0, 0.0, 0.0))
         for index, slot in enumerate((SLOT_EDEN_P2, SLOT_EDEN_P3), start=1):
             if len(pads) > index:
                 pad = pads[index]
@@ -367,7 +386,7 @@ class Relay:
             msg = struct.unpack_from("<I", data, 16)[0]
             active = set(self.active_slots)
             replies = []
-            if msg in (MSG_VERSION, MSG_INFO, MSG_DATA):
+            if msg in (MSG_VERSION, MSG_INFO):
                 replies.append(build_version(self.server_id))
             if msg == MSG_INFO and len(data) >= 24:
                 count = max(0, min(struct.unpack_from("<i", data, 20)[0], 4))
@@ -380,9 +399,12 @@ class Relay:
                     with self.lock:
                         entry = self.subs.setdefault(addr, [0.0, {}])
                         entry[0] = time.monotonic()
-                        for s in wanted:
-                            entry[1].setdefault(s, 0)
-                    for s in sorted(wanted & active):
+                        new_slots = wanted - set(entry[1])
+                        for s in new_slots:
+                            entry[1][s] = 0
+                    # Answer only new subscriptions: Cemu re-requests after every message it receives,
+                    # so replying to each renewal would start a request/reply ping-pong.
+                    for s in sorted(new_slots & active):
                         replies.append(build_info(self.server_id, s, 2))
             for reply in replies:
                 try:
