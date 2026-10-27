@@ -19,6 +19,8 @@ The motion sources are picked automatically:
       - InputPlumber's virtual DualSense (target "DualSense Edge", InputPlumber 0.82 or later), which
         on the ROG Ally X reports a frame rotated 180 degrees about X compared with a real DualSense
         and is corrected here,
+      - InputPlumber's virtual Steam Deck controller (the default target, InputPlumber 0.82 or later),
+        read from its hidraw node, so no target change is needed and Steam Input keeps its gyro,
       - iio-dsu-bridge on 127.0.0.1:26760 (InputPlumber 0.81 or earlier, which leaves the IMU free).
 
 So docking the handheld and turning on one or more DualSense pads switches the motion sources with no
@@ -66,6 +68,12 @@ DS_ACC_RES_PER_G = 8192.0
 DS_GYRO_RES_PER_DEG_S = 1024.0
 EV_SYN, EV_ABS = 0, 3
 EVENT = struct.Struct("=qqHHi")
+
+# Steam Deck controller state report, as read by SDL (SDL_hidapi_steamdeck.c)
+DECK_VENDOR = "000028DE"
+DECK_ACC_RES_PER_G = 16384.0
+DECK_GYRO_RES_PER_DEG_S = 32768.0 / 2000.0
+DECK_ROTATE_180_X = False  # set after checking the poses with --sources
 
 
 def finish_packet(buf):
@@ -317,6 +325,109 @@ class DualSenseManager:
             return self.samples + sum(pad.samples for pad in self.pads)
 
 
+def deck_to_dsu(ax, ay, az, gx, gy, gz):
+    """One Steam Deck state report to the DSU convention used by the bridge.
+
+    SDL reads the Deck report as accel (X, Z, -Y) at 16384 per g and gyro (X, Z, -Y) at 16.384 per deg/s
+    (SDL_hidapi_steamdeck.c); from there it is the same conversion as a DualSense.
+    """
+    sdl_accel = (ax / DECK_ACC_RES_PER_G, az / DECK_ACC_RES_PER_G, -ay / DECK_ACC_RES_PER_G)
+    sdl_gyro = (gx / DECK_GYRO_RES_PER_DEG_S, gz / DECK_GYRO_RES_PER_DEG_S, -gy / DECK_GYRO_RES_PER_DEG_S)
+    accel = tuple(-v for v in sdl_accel)
+    gyro = (sdl_gyro[0], -sdl_gyro[1], -sdl_gyro[2])
+    if DECK_ROTATE_180_X:
+        return flip_virtual(accel, gyro)
+    return accel, gyro
+
+
+def parse_deck_report(data):
+    """(ax, ay, az, gx, gy, gz) from a Steam Deck state report (type 9), or None."""
+    if len(data) < 36 or data[0] != 0x01 or data[1] != 0x00 or data[2] != 0x09 or data[3] != 64:
+        return None
+    return struct.unpack_from("<6h", data, 24)
+
+
+class DeckSource:
+    """The handheld IMU, read from InputPlumber's virtual Steam Deck controller (its hidraw node).
+
+    This is InputPlumber's default target on Bazzite, so it needs no target change and keeps the gyro
+    available to Steam Input as well. Hidraw nodes can be read by several programs at once.
+    """
+
+    name = "handheld IMU (InputPlumber Deck)"
+
+    def __init__(self):
+        self.latest = None
+        self.samples = 0
+        self.error = None
+
+    @staticmethod
+    def find_nodes():
+        nodes = []
+        for uevent in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
+            try:
+                fields = dict(line.split("=", 1) for line in open(uevent).read().splitlines() if "=" in line)
+            except OSError:
+                continue
+            parts = fields.get("HID_ID", "").split(":")
+            if len(parts) == 3 and parts[1].upper() == DECK_VENDOR:
+                nodes.append("/dev/" + uevent.split("/")[4])
+        return nodes
+
+    def run(self, stop):
+        fds = {}
+        last_scan = 0.0
+        try:
+            while not stop.is_set():
+                now = time.monotonic()
+                if now - last_scan >= SCAN_SECONDS:
+                    last_scan = now
+                    present = set(self.find_nodes())
+                    for path in [p for p in fds if p not in present]:
+                        os.close(fds.pop(path))
+                    for path in present - set(fds):
+                        try:
+                            fds[path] = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                            self.error = None
+                        except PermissionError:
+                            self.error = f"permission denied on {path}"
+                        except OSError:
+                            pass
+                if not fds:
+                    stop.wait(0.5)
+                    continue
+                ready = select.select(list(fds.values()), [], [], 0.2)[0]
+                for fd in ready:
+                    try:
+                        data = os.read(fd, 64)
+                    except OSError:  # removed, picked up by the next scan
+                        continue
+                    values = parse_deck_report(data)
+                    if values:
+                        accel, gyro = deck_to_dsu(*values)
+                        self.latest = (time.monotonic(), accel, gyro)
+                        self.samples += 1
+        finally:
+            for fd in fds.values():
+                os.close(fd)
+
+
+def select_sources(dualsense, deck, bridge, now):
+    """(main source, extra pads) right now.
+
+    Real DualSense pads come first, in connection order. Without one, the handheld IMU is the main
+    source, from InputPlumber's virtual DualSense, its virtual Steam Deck, or iio-dsu-bridge.
+    """
+    pads = dualsense.live(now)
+    if pads and not getattr(pads[0], "virtual", False):
+        return pads[0], pads[1:]
+    for source in pads[:1] + [deck, bridge]:
+        sample = source.latest
+        if sample and now - sample[0] <= STALE_SECONDS:
+            return source, []
+    return None, []
+
+
 class _Hold:
     """Placeholder source while nothing is live: slots 1 and 2 keep sending a device at rest."""
 
@@ -328,12 +439,13 @@ HOLD = _Hold()
 
 class Relay:
     def __init__(self, listen_port=26761, rate=200.0, host="127.0.0.1", log=print,
-                 bridge=None, dualsense=None):
+                 bridge=None, dualsense=None, deck=None):
         self.rate = rate
         self.log = log
         self.server_id = random.getrandbits(32)
         self.bridge = bridge if bridge is not None else BridgeSource(host)
         self.dualsense = dualsense if dualsense is not None else DualSenseManager()
+        self.deck = deck if deck is not None else DeckSource()
         self.down = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.down.bind((host, listen_port))
         self.down.settimeout(0.2)
@@ -354,12 +466,7 @@ class Relay:
         when a game starts, which takes a few seconds), they hold the last attitude with the gyro at
         rest. Cemu only asks for more data after it receives some, so a gap would drop it for good.
         """
-        pads = self.dualsense.live(now)
-        main = pads[0] if pads else None
-        if main is None:
-            sample = self.bridge.latest
-            if sample and now - sample[0] <= STALE_SECONDS:
-                main = self.bridge
+        main, extra = select_sources(self.dualsense, self.deck, self.bridge, now)
         out = {}
         if main is not None:
             accel, gyro = main.latest[1], main.latest[2]
@@ -369,10 +476,8 @@ class Relay:
         else:
             out[SLOT_CEMU] = (HOLD, self.last_accel, (0.0, 0.0, 0.0))
             out[SLOT_EDEN_P1] = (HOLD, self.last_accel, (0.0, 0.0, 0.0))
-        for index, slot in enumerate((SLOT_EDEN_P2, SLOT_EDEN_P3), start=1):
-            if len(pads) > index:
-                pad = pads[index]
-                out[slot] = (pad, pad.latest[1], tuple(g * GYRO_SCALE for g in pad.latest[2]))
+        for pad, slot in zip(extra, (SLOT_EDEN_P2, SLOT_EDEN_P3)):
+            out[slot] = (pad, pad.latest[1], tuple(g * GYRO_SCALE for g in pad.latest[2]))
         return out
 
     def _downstream_loop(self):
@@ -463,6 +568,7 @@ class Relay:
     def start(self):
         for target in (lambda: self.bridge.run(self.stop),
                        lambda: self.dualsense.run(self.stop),
+                       lambda: self.deck.run(self.stop),
                        self._downstream_loop,
                        self._emit_loop):
             thread = threading.Thread(target=target, daemon=True)
@@ -480,7 +586,11 @@ class Relay:
         self.log(f"DSU relay on 127.0.0.1:{self.listen_port} at {self.rate:g} Hz "
                  f"(slot 1 = Cemu, slots 2-4 = Eden players 1-3)")
         start = last_log = time.monotonic()
-        last = dict(self.stats, bridge=self.bridge.samples, dualsense=self.dualsense.total_samples())
+        def counters():
+            return dict(self.stats, bridge=self.bridge.samples, deck=self.deck.samples,
+                        dualsense=self.dualsense.total_samples())
+
+        last = counters()
         try:
             while not seconds or time.monotonic() - start < seconds:
                 time.sleep(0.2)
@@ -489,12 +599,13 @@ class Relay:
                     window = now - last_log
                     with self.lock:
                         subs = len(self.subs)
-                    dualsense = self.dualsense.total_samples()
-                    self.log(f"{self.layout or 'no source'} | bridge "
-                             f"{(self.bridge.samples - last['bridge']) / window:.0f}/s, pads "
-                             f"{(dualsense - last['dualsense']) / window:.0f}/s, sent "
-                             f"{(self.stats['sent'] - last['sent']) / window:.0f}/s, subscribers {subs}")
-                    last = dict(self.stats, bridge=self.bridge.samples, dualsense=dualsense)
+                    current = counters()
+                    rate = {k: (current[k] - last[k]) / window for k in current}
+                    self.log(f"{self.layout or 'no source'} | deck {rate['deck']:.0f}/s, "
+                             f"dualsense {rate['dualsense']:.0f}/s, bridge {rate['bridge']:.0f}/s, "
+                             f"sent {rate['sent']:.0f}/s, subscribers {subs}"
+                             + (f" | {self.deck.error}" if self.deck.error else ""))
+                    last = current
                     last_log = now
         except KeyboardInterrupt:
             pass
@@ -505,8 +616,8 @@ class Relay:
 def show_sources(seconds, log=print):
     """Print every motion source with its slot, once per second."""
     stop = threading.Event()
-    bridge, pads = BridgeSource(), DualSenseManager()
-    threads = [threading.Thread(target=s.run, args=(stop,), daemon=True) for s in (bridge, pads)]
+    bridge, pads, deck = BridgeSource(), DualSenseManager(), DeckSource()
+    threads = [threading.Thread(target=s.run, args=(stop,), daemon=True) for s in (bridge, pads, deck)]
     for thread in threads:
         thread.start()
     log("slot | source                  | accel g            | gyro deg/s")
@@ -515,14 +626,12 @@ def show_sources(seconds, log=print):
         while time.monotonic() < end:
             time.sleep(1.0)
             now = time.monotonic()
-            live = pads.live(now)
-            if not live:
-                sample = bridge.latest
-                rows = [("1+2", bridge.name, sample)] if sample and now - sample[0] <= STALE_SECONDS else []
-            else:
-                rows = [("1+2", live[0].name, live[0].latest)]
-                for index, pad in enumerate(live[1:3], start=3):
-                    rows.append((str(index), pad.name, pad.latest))
+            main, extra = select_sources(pads, deck, bridge, now)
+            rows = [("1+2", main.name, main.latest)] if main else []
+            for index, pad in enumerate(extra[:2], start=3):
+                rows.append((str(index), pad.name, pad.latest))
+            if deck.error:
+                log(f"note: {deck.error}")
             if not rows:
                 log("no motion source")
             for slot, name, sample in rows:
