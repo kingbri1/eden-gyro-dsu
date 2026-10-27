@@ -1,42 +1,60 @@
-# Gyro in Eden and Cemu on ROG Ally X (Bazzite 44+): no DualSense emulation, Steam Input stays on
+# Gyro in Eden and Cemu on ROG Ally X (Bazzite 44+), Steam Input stays on
 
 Working motion controls in **Eden** (Mario Kart 8 Deluxe steering) and **Cemu** (BOTW bow aiming and the
-Myahm Agana tilt maze), both handheld and docked with real DualSense pads, keeping Xbox-style glyphs,
-Steam Input and the default InputPlumber target.
+Myahm Agana tilt maze), both handheld and docked with real DualSense pads, with Steam Input on.
 
-- **Tested on:** ROG Ally X (BMI323 IMU), Bazzite 44, InputPlumber 0.81 (Steam Deck `deck-uhid` target, the
-  default), Steam Input on, Eden v0.2.1 AppImage, Cemu 2.x, a DualSense over Bluetooth, games launched from
-  Gaming Mode.
-- **Other devices** (Ally, Legion Go S, ...) need their own bridge matrices: see [Other devices](#other-devices).
+- **Tested on:** ROG Ally X (BMI323 IMU), Bazzite 44 with InputPlumber 0.83 (and earlier with 0.81), Steam
+  Input on, Eden v0.2.1 AppImage, Cemu 2.x, a DualSense over Bluetooth, games launched from Gaming Mode.
+- **Other devices** (Ally, Legion Go S, ...): see [Other devices](#other-devices).
 
 ## Why this setup
 
-- Through InputPlumber's virtual controllers, emulators get broken motion data: the Steam Deck target has an
-  unscaled, rotated accelerometer and the DualSense target has a fake sensor timestamp and a bad calibration
-  report ([InputPlumber #715](https://github.com/ShadowBlip/InputPlumber/issues/715); fixes are in progress in
-  [PR #612](https://github.com/ShadowBlip/InputPlumber/pull/612)). With Steam Input on, emulators only see
-  Steam's virtual pad, which has no sensors — and that stays true for a real DualSense too.
-- [iio-dsu-bridge](https://github.com/Sebalvarez97/iio-dsu-bridge) reads the handheld IMU and serves it over
-  cemuhook/DSU, but the default `rog-ally.yaml` frame reads a sideways tilt as a horizontal rotation: tilt
-  puzzles rotate instead of tilting and steering gets stuck. The matrices from
-  [issue #15](https://github.com/Sebalvarez97/iio-dsu-bridge/issues/15) fix it for both emulators.
-- Eden needs two more things: its DSU gyro is divided by 312 instead of 360, and it samples motion at a fixed
-  200 Hz, so a slower or irregular stream makes the steering stick.
-- **Fix:** the bridge with the issue #15 matrices, plus a small relay that publishes one DSU server with four
-  slots at exactly 200 Hz and picks the motion source automatically — a connected DualSense if there is one,
-  the handheld IMU otherwise. Nothing changes in the emulators when you dock or undock.
+- With Steam Input on, emulators only see Steam's virtual pad, which has no sensors — and that stays true for a
+  real DualSense too. So motion has to reach the emulators another way: cemuhook/DSU.
+- Eden divides DSU gyro values by 312 instead of 360, and it samples motion at a fixed 200 Hz, so a slower or
+  irregular stream makes the steering stick.
+- **Fix:** a small relay that publishes one DSU server with four slots at exactly 200 Hz and picks the motion
+  source automatically: a real DualSense if one is connected, the handheld IMU otherwise. Nothing changes in the
+  emulators when you dock or undock.
+- Where the handheld IMU comes from depends on your InputPlumber version:
+  - **InputPlumber 0.82 or later** (Bazzite 44.20261026 and later): InputPlumber reads the IMU itself, and its
+    **DualSense Edge** target now has correct scale and timestamps
+    ([InputPlumber #715](https://github.com/ShadowBlip/InputPlumber/issues/715)). The relay reads that virtual
+    pad. On the Ally X its frame is rotated 180° about X compared with a real DualSense; the relay corrects it.
+  - **InputPlumber 0.81 or earlier:** its targets have broken motion data, so the IMU is read by
+    [iio-dsu-bridge](https://github.com/Sebalvarez97/iio-dsu-bridge) with the matrices from
+    [issue #15](https://github.com/Sebalvarez97/iio-dsu-bridge/issues/15). With 0.82 or later the bridge stops
+    receiving data, because InputPlumber holds the IMU.
 
 ```
-handheld IMU --> iio-dsu-bridge :26760 --\
-                                          >--> dsu-relay :26761
-DualSense pads (Bluetooth) --------------/         |
-                                                   +--> slot 1: main pad, real deg/s   --> Cemu
-                                                   +--> slot 2: main pad, x 312/360    --> Eden player 1
-                                                   +--> slot 3: second pad             --> Eden player 2
-                                                   +--> slot 4: third pad              --> Eden player 3
+InputPlumber 0.82+: virtual DualSense Edge --\
+InputPlumber 0.81:  iio-dsu-bridge :26760 ----+--> dsu-relay :26761
+real DualSense pads (Bluetooth) -------------/         |
+                                                       +--> slot 1: main pad, real deg/s   --> Cemu
+                                                       +--> slot 2: main pad, x 312/360    --> Eden player 1
+                                                       +--> slot 3: second pad             --> Eden player 2
+                                                       +--> slot 4: third pad              --> Eden player 3
 ```
 
-## 1. iio-dsu-bridge (the handheld IMU)
+Check your version with `rpm -q inputplumber`.
+
+## 1a. InputPlumber 0.82 or later: DualSense Edge target for the emulator games
+
+In OpenGamepadUI, set the gamepad target to **DualSense Edge** only for the games you play in Eden and Cemu,
+so everything else keeps the Steam Deck target and Xbox-style glyphs. OpenGamepadUI stores it per game in
+`~/.local/share/opengamepadui/settings.cfg`:
+
+```ini
+[game.mario kart 8 deluxe]
+gamepad_profile_target="ds5-edge"
+```
+
+The section name is the game's name as shown in the library, in lowercase. Keep Steam Input **on** for these
+games: the buttons still come from Steam's virtual pad, the relay takes the motion from the virtual DualSense.
+
+Skip section 1b.
+
+## 1b. InputPlumber 0.81 or earlier: iio-dsu-bridge
 
 Install it following its README:
 
@@ -112,7 +130,8 @@ udp_input_servers=127.0.0.1:26761
 
 For a non-AppImage install, pass the path to your `qt-config.ini` as an argument.
 
-Leave Steam Input **on** (default) and keep the default InputPlumber target.
+Leave Steam Input **on** (default). With InputPlumber 0.82 or later, use the per-game DualSense Edge target of
+section 1a; with 0.81 or earlier, keep the default target.
 
 ## 5. Check it
 
@@ -120,8 +139,9 @@ Leave Steam Input **on** (default) and keep the default InputPlumber target.
 journalctl --user -u dsu-relay-eden -n 5 --no-pager
 ```
 
-You should see a line like `motion sources -> slot 1: handheld IMU (bridge), slot 2: handheld IMU (bridge)`,
-and after a minute of play a line with the rates and the number of subscribers.
+You should see a line like `motion sources -> slot 1: handheld IMU (InputPlumber), slot 2: handheld IMU
+(InputPlumber)` (or `handheld IMU (bridge)` with InputPlumber 0.81), and after a minute of play a line with the
+rates and the number of subscribers.
 
 To see the sources and their slots live, with the values they report:
 
@@ -129,7 +149,8 @@ To see the sources and their slots live, with the values they report:
 dsu-relay --sources 20
 ```
 
-Lying flat, screen (or buttons) up, every source should read about `0.00 -1.00 0.00` on the accelerometer.
+Every source should read about `0 -1 0` lying flat (screen or buttons up), `0 0 +1` upright with the screen
+facing you, and `-1 0 0` with the right edge up.
 
 ## 6. Docked, with one or more DualSense pads
 
@@ -147,9 +168,12 @@ python3 /tmp/eden-motion-dsu.py --players 2
 
 ## Troubleshooting
 
-- **No motion in a game:** check `journalctl --user -u dsu-relay-eden -n 5`. `no source` means neither the
-  bridge nor a pad is sending; `subscribers 0` means the emulator is not connecting to port 26761.
-- **`from bridge 0/s`:** the bridge is not running: `systemctl --user status iio-dsu-bridge`.
+- **No motion in a game:** check `journalctl --user -u dsu-relay-eden -n 5`. `no source` means nothing is
+  sending: with InputPlumber 0.82 or later, check that the game uses the DualSense Edge target; with 0.81, that
+  the bridge runs (`systemctl --user status iio-dsu-bridge`). `subscribers 0` means the emulator is not
+  connecting to port 26761.
+- **Buttons swapped (A/B, X/Y):** Steam Input is off for that game, so the emulator reads the DualSense layout
+  directly. Turn Steam Input back on.
 - **Cemu says the DSU controller is disconnected:** restart Cemu after changing the port.
 - **Do not add `threshold:`** to Eden's motion binding: in testing it disabled the gyro completely.
 - **Slow tilts are ignored:** both emulators zero the gyro below about 0.9 °/s (Cemu) and 2.5 °/s (Eden). That
@@ -157,10 +181,11 @@ python3 /tmp/eden-motion-dsu.py --players 2
 
 ## Other devices
 
-The bridge matrices above were verified on the Ally X. Another handheld needs its own `accel_matrix` and
-`gyro_matrix` in the bridge config; the relay does not touch the axes, it only rescales the gyro for Eden's
-slots. The DualSense conversion is device-independent. If you work out the matrices for another handheld,
-please share them.
+Everything here was verified on the Ally X. The conversion of a real DualSense is device-independent. For the
+handheld IMU, other devices may differ: with InputPlumber 0.82 or later, check the three poses with
+`dsu-relay --sources` (the 180° correction in the relay was measured on the Ally X and may not apply elsewhere);
+with 0.81 or earlier, the bridge needs that device's own `accel_matrix`/`gyro_matrix`. If you work out the values
+for another handheld, please share them.
 
 ## Uninstall
 
@@ -170,8 +195,8 @@ rm -f ~/.local/bin/dsu-relay ~/.config/systemd/user/dsu-relay-eden.service
 systemctl --user daemon-reload
 ```
 
-To restore Eden, copy back the `qt-config.ini.bak-*` file created next to `qt-config.ini`, and in Cemu set the
-DSU port back to 26760 (or remove the DSU controller).
+To restore Eden, copy back the `qt-config.ini.bak-*` file created next to `qt-config.ini`; in Cemu remove the
+DSU controller; in OpenGamepadUI remove the per-game DualSense Edge targets.
 
 ## Upstream reports
 
