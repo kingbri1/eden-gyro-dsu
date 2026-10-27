@@ -18,16 +18,17 @@ Myahm Agana tilt maze), both handheld and docked with real DualSense pads, with 
   emulators when you dock or undock.
 - Where the handheld IMU comes from depends on your InputPlumber version:
   - **InputPlumber 0.82 or later** (Bazzite 44.20261026 and later): InputPlumber reads the IMU itself, and its
-    **DualSense Edge** target now has correct scale and timestamps
-    ([InputPlumber #715](https://github.com/ShadowBlip/InputPlumber/issues/715)). The relay reads that virtual
-    pad. On the Ally X its frame is rotated 180° about X compared with a real DualSense; the relay corrects it.
+    targets now report it with correct scale
+    ([InputPlumber #715](https://github.com/ShadowBlip/InputPlumber/issues/715)). The relay reads it from the
+    default **Steam Deck** target (or from the DualSense Edge target, if you use that one). On the Ally X both
+    report a frame rotated 180° about X compared with a real pad; the relay corrects it.
   - **InputPlumber 0.81 or earlier:** its targets have broken motion data, so the IMU is read by
     [iio-dsu-bridge](https://github.com/Sebalvarez97/iio-dsu-bridge) with the matrices from
     [issue #15](https://github.com/Sebalvarez97/iio-dsu-bridge/issues/15). With 0.82 or later the bridge stops
     receiving data, because InputPlumber holds the IMU.
 
 ```
-InputPlumber 0.82+: virtual DualSense Edge --\
+InputPlumber 0.82+: virtual Steam Deck pad --\
 InputPlumber 0.81:  iio-dsu-bridge :26760 ----+--> dsu-relay :26761
 real DualSense pads (Bluetooth) -------------/         |
                                                        +--> slot 1: main pad, real deg/s   --> Cemu
@@ -38,19 +39,11 @@ real DualSense pads (Bluetooth) -------------/         |
 
 Check your version with `rpm -q inputplumber`.
 
-## 1a. InputPlumber 0.82 or later: DualSense Edge target for the emulator games
+## 1a. InputPlumber 0.82 or later: nothing to install
 
-In OpenGamepadUI, set the gamepad target to **DualSense Edge** only for the games you play in Eden and Cemu,
-so everything else keeps the Steam Deck target and Xbox-style glyphs. OpenGamepadUI stores it per game in
-`~/.local/share/opengamepadui/settings.cfg`:
-
-```ini
-[game.mario kart 8 deluxe]
-gamepad_profile_target="ds5-edge"
-```
-
-The section name is the game's name as shown in the library, in lowercase. Keep Steam Input **on** for these
-games: the buttons still come from Steam's virtual pad, the relay takes the motion from the virtual DualSense.
+Keep the default **Steam Deck** target in OpenGamepadUI, so Xbox-style glyphs and Steam Input's own gyro keep
+working everywhere. The relay reads the motion from that virtual pad's hidraw node, alongside Steam. If you had
+iio-dsu-bridge installed, disable it: `systemctl --user disable --now iio-dsu-bridge`.
 
 Skip section 1b.
 
@@ -130,8 +123,7 @@ udp_input_servers=127.0.0.1:26761
 
 For a non-AppImage install, pass the path to your `qt-config.ini` as an argument.
 
-Leave Steam Input **on** (default). With InputPlumber 0.82 or later, use the per-game DualSense Edge target of
-section 1a; with 0.81 or earlier, keep the default target.
+Leave Steam Input **on** (default) and keep the default Steam Deck target.
 
 ## 5. Check it
 
@@ -139,8 +131,8 @@ section 1a; with 0.81 or earlier, keep the default target.
 journalctl --user -u dsu-relay-eden -n 5 --no-pager
 ```
 
-You should see a line like `motion sources -> slot 1: handheld IMU (InputPlumber), slot 2: handheld IMU
-(InputPlumber)` (or `handheld IMU (bridge)` with InputPlumber 0.81), and after a minute of play a line with the
+You should see a line like `motion sources -> slot 1: handheld IMU (InputPlumber Deck), slot 2: handheld IMU
+(InputPlumber Deck)` (or `handheld IMU (bridge)` with InputPlumber 0.81), and after a minute of play a line with the
 rates and the number of subscribers.
 
 To see the sources and their slots live, with the values they report:
@@ -169,7 +161,8 @@ python3 /tmp/eden-motion-dsu.py --players 2
 ## Troubleshooting
 
 - **No motion in a game:** check `journalctl --user -u dsu-relay-eden -n 5`. `no source` means nothing is
-  sending: with InputPlumber 0.82 or later, check that the game uses the DualSense Edge target; with 0.81, that
+  sending: with InputPlumber 0.82 or later, run `dsu-relay --sources 5` (a `permission denied` note means your user cannot
+  read the virtual Steam Deck hidraw node); with 0.81, check that
   the bridge runs (`systemctl --user status iio-dsu-bridge`). `subscribers 0` means the emulator is not
   connecting to port 26761.
 - **Buttons swapped (A/B, X/Y):** Steam Input is off for that game, so the emulator reads the DualSense layout
@@ -196,7 +189,7 @@ systemctl --user daemon-reload
 ```
 
 To restore Eden, copy back the `qt-config.ini.bak-*` file created next to `qt-config.ini`; in Cemu remove the
-DSU controller; in OpenGamepadUI remove the per-game DualSense Edge targets.
+DSU controller.
 
 ## Upstream reports
 
