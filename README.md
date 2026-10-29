@@ -20,8 +20,9 @@ Myahm Agana tilt maze), both handheld and docked with real DualSense pads, with 
   - **InputPlumber 0.82 or later** (Bazzite 44.20261026 and later): InputPlumber reads the IMU itself, and its
     targets now report it with correct scale
     ([InputPlumber #715](https://github.com/ShadowBlip/InputPlumber/issues/715)). The relay reads it from the
-    default **Steam Deck** target (or from the DualSense Edge target, if you use that one). On the Ally X both
-    report a frame rotated 180° about X compared with a real pad; the relay corrects it.
+    default **Steam Deck** target (or from the DualSense Edge target, if you use that one). InputPlumber orients
+    the IMU for Steam Input's convention; the relay reads the `mount_matrix` from InputPlumber's device config
+    and rotates the data into the frame the emulators expect, so it keeps working if that matrix changes.
   - **InputPlumber 0.81 or earlier:** its targets have broken motion data, so the IMU is read by
     [iio-dsu-bridge](https://github.com/Sebalvarez97/iio-dsu-bridge) with the matrices from
     [issue #15](https://github.com/Sebalvarez97/iio-dsu-bridge/issues/15). With 0.82 or later the bridge stops
@@ -176,7 +177,7 @@ python3 /tmp/eden-motion-dsu.py --players 2
 
 Everything here was verified on the Ally X. The conversion of a real DualSense is device-independent. For the
 handheld IMU, other devices may differ: with InputPlumber 0.82 or later, check the three poses with
-`dsu-relay --sources` (the 180° correction in the relay was measured on the Ally X and may not apply elsewhere);
+`dsu-relay --sources` (the automatic correction is only enabled on the Ally X, board `RC72LA`);
 with 0.81 or earlier, the bridge needs that device's own `accel_matrix`/`gyro_matrix`. If you work out the values
 for another handheld, please share them.
 

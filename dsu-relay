@@ -16,12 +16,12 @@ The motion sources are picked automatically:
   * every connected real DualSense / DualSense Edge (kernel hid-playstation "Motion Sensors" nodes),
     in the order they connect: first pad = main pad,
   * otherwise the handheld IMU, from whichever of these is available:
-      - InputPlumber's virtual DualSense (target "DualSense Edge", InputPlumber 0.82 or later), which
-        on the ROG Ally X reports a frame rotated 180 degrees about X compared with a real DualSense
-        and is corrected here,
+      - InputPlumber's virtual DualSense (target "DualSense Edge", InputPlumber 0.82 or later),
       - InputPlumber's virtual Steam Deck controller (the default target, InputPlumber 0.82 or later),
         read from its hidraw node, so no target change is needed and Steam Input keeps its gyro,
       - iio-dsu-bridge on 127.0.0.1:26760 (InputPlumber 0.81 or earlier, which leaves the IMU free).
+    On the ROG Ally X the relay reads the mount_matrix InputPlumber uses and rotates its virtual pads
+    into the frame the emulators expect, so it keeps working if InputPlumber changes that matrix.
 
 So docking the handheld and turning on one or more DualSense pads switches the motion sources with no
 config change in the emulators, and turning them off switches back to the handheld IMU.
@@ -38,6 +38,7 @@ import argparse
 import glob
 import os
 import random
+import re
 import select
 import socket
 import struct
@@ -73,7 +74,18 @@ EVENT = struct.Struct("=qqHHi")
 DECK_VENDOR = "000028DE"
 DECK_ACC_RES_PER_G = 16384.0
 DECK_GYRO_RES_PER_DEG_S = 32768.0 / 2000.0
-DECK_ROTATE_180_X = False  # set after checking the poses with --sources
+
+# Handheld IMU from InputPlumber's virtual pads. InputPlumber rotates the raw IIO axes with the mount_matrix
+# of its device config; the emulators want another frame (flat pad = handheld lying screen up). The relay
+# reads that mount_matrix and undoes it, so it keeps working whatever matrix InputPlumber ships.
+IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+INPUTPLUMBER_DEVICE_DIRS = ("/etc/inputplumber/devices.d", "/usr/share/inputplumber/devices")
+# ROG Ally X: raw bmi323 axes are x = right, y = -(screen up), z = -(screen normal). This maps them to the
+# SDL-convention frame that Cemu and Eden expect (verified in game; same frame as iio-dsu-bridge issue #15).
+ALLY_X_BOARD = "RC72LA"
+ALLY_X_EMULATOR_FRAME = ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))
+ALLY_X_MATRIX_083 = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))  # InputPlumber 0.82-0.83
+HANDHELD_CORRECTION = IDENTITY  # set by configure_handheld() at startup
 
 
 def finish_packet(buf):
@@ -180,14 +192,94 @@ def ds_to_dsu(values, res):
     return accel, gyro
 
 
-def flip_virtual(accel, gyro):
-    """InputPlumber's virtual DualSense on the ROG Ally X, rotated 180 degrees about X to match a real pad.
+def mat_vec(m, v):
+    return tuple(m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] for i in range(3))
 
-    Measured: lying flat it reads Y +1 g and screen-up-vertical Z -1 g after ds_to_dsu, where a real
-    DualSense and the bridge read Y -1 g and Z +1 g; X matches. A proper rotation, so the gyro gets the
-    same correction.
+
+def mat_mul(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+
+
+def transpose(m):
+    return tuple(tuple(m[j][i] for j in range(3)) for i in range(3))
+
+
+def is_rotation(m):
+    product = mat_mul(m, transpose(m))
+    return all(abs(product[i][j] - IDENTITY[i][j]) < 1e-6 for i in range(3) for j in range(3))
+
+
+def parse_mount_matrix(text):
+    """The (x, y, z) rows of the first mount_matrix in an InputPlumber device config, or None."""
+    match = re.search(r"\n\s*mount_matrix:\s*\n\s*x:\s*\[([^\]]*)\]\s*\n\s*y:\s*\[([^\]]*)\]\s*\n\s*z:\s*\[([^\]]*)\]",
+                      "\n" + text)
+    if not match:
+        return None
+    try:
+        rows = tuple(tuple(float(v) for v in group.split(",")) for group in match.groups())
+    except ValueError:
+        return None
+    return rows if all(len(row) == 3 for row in rows) else None
+
+
+def find_inputplumber_matrix(board, dirs=INPUTPLUMBER_DEVICE_DIRS):
+    """(mount_matrix, path) of the InputPlumber config used for this board, or None.
+
+    Same order as InputPlumber: configs sorted by file name, and for the same name /etc wins.
     """
-    return (accel[0], -accel[1], -accel[2]), (gyro[0], -gyro[1], -gyro[2])
+    entries = []
+    for priority, directory in enumerate(dirs):
+        for path in glob.glob(os.path.join(directory, "*.yaml")):
+            entries.append((os.path.basename(path), priority, path))
+    for _, _, path in sorted(entries):
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        if re.search(r"board_name:\s*" + re.escape(board) + r"\s*$", text, re.M) and "iio:" in text:
+            matrix = parse_mount_matrix(text)
+            if matrix:
+                return matrix, path
+    return None
+
+
+def handheld_correction_for(matrix):
+    """Rotation that takes InputPlumber's frame (mount_matrix applied to the raw axes) to the emulator frame."""
+    return mat_mul(ALLY_X_EMULATOR_FRAME, transpose(matrix))
+
+
+def configure_handheld(log=print, dirs=INPUTPLUMBER_DEVICE_DIRS, board=None):
+    """Set HANDHELD_CORRECTION from the mount_matrix InputPlumber uses on this device."""
+    global HANDHELD_CORRECTION
+    if board is None:
+        try:
+            board = open("/sys/class/dmi/id/board_name").read().strip()
+        except OSError:
+            board = ""
+    if board != ALLY_X_BOARD:
+        HANDHELD_CORRECTION = IDENTITY
+        log(f"handheld: board {board or 'unknown'} not verified, using InputPlumber's frame as is "
+            "(check the poses with --sources)")
+        return HANDHELD_CORRECTION
+    found = find_inputplumber_matrix(board, dirs)
+    if found and is_rotation(found[0]):
+        matrix, origin = found
+    else:
+        matrix, origin = ALLY_X_MATRIX_083, "not found, assuming InputPlumber 0.83"
+    HANDHELD_CORRECTION = handheld_correction_for(matrix)
+    log(f"handheld: InputPlumber mount_matrix {matrix} ({origin}) -> correction {HANDHELD_CORRECTION}")
+    return HANDHELD_CORRECTION
+
+
+def correct_handheld(accel, gyro, correction=None):
+    """Apply the handheld correction to DSU-convention accel and gyro.
+
+    The correction is a rotation in SDL's frame. DSU accel is the negated SDL accel, so it rotates the
+    same way; DSU gyro is SDL gyro with y and z flipped (D), so it rotates by D * C * D.
+    """
+    c = HANDHELD_CORRECTION if correction is None else correction
+    d = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
+    return mat_vec(c, accel), mat_vec(mat_mul(mat_mul(d, c), d), gyro)
 
 
 def is_virtual_device(device_dir):
@@ -252,7 +344,7 @@ class DualSensePad:
                     elif etype == EV_SYN and code == 0:
                         accel, gyro = ds_to_dsu(values, res)
                         if self.virtual:
-                            accel, gyro = flip_virtual(accel, gyro)
+                            accel, gyro = correct_handheld(accel, gyro)
                         self.latest = (time.monotonic(), accel, gyro)
                         self.samples += 1
         except OSError:  # unplugged
@@ -335,9 +427,7 @@ def deck_to_dsu(ax, ay, az, gx, gy, gz):
     sdl_gyro = (gx / DECK_GYRO_RES_PER_DEG_S, gz / DECK_GYRO_RES_PER_DEG_S, -gy / DECK_GYRO_RES_PER_DEG_S)
     accel = tuple(-v for v in sdl_accel)
     gyro = (sdl_gyro[0], -sdl_gyro[1], -sdl_gyro[2])
-    if DECK_ROTATE_180_X:
-        return flip_virtual(accel, gyro)
-    return accel, gyro
+    return correct_handheld(accel, gyro)
 
 
 def parse_deck_report(data):
@@ -655,6 +745,7 @@ def main():
                         help="print the motion sources and their slots instead of running the relay")
     args = parser.parse_args()
     log = lambda text: print(text, flush=True)
+    configure_handheld(log)
     if args.sources:
         show_sources(args.sources, log=log)
         return
