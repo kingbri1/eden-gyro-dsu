@@ -85,7 +85,11 @@ INPUTPLUMBER_DEVICE_DIRS = ("/etc/inputplumber/devices.d", "/usr/share/inputplum
 ALLY_X_BOARD = "RC72LA"
 ALLY_X_EMULATOR_FRAME = ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))
 ALLY_X_MATRIX_083 = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))  # InputPlumber 0.82-0.83
+ODIN_3_MODEL = "AYN Odin 3"
+ODIN_3_ACCEL_CORRECTION = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0))
+ODIN_3_GYRO_CORRECTION = ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 HANDHELD_CORRECTION = IDENTITY  # set by configure_handheld() at startup
+HANDHELD_GYRO_CORRECTION = None  # device-specific override when accel and gyro need different corrections
 
 
 def finish_packet(buf):
@@ -250,13 +254,24 @@ def handheld_correction_for(matrix):
 
 def configure_handheld(log=print, dirs=INPUTPLUMBER_DEVICE_DIRS, board=None):
     """Set HANDHELD_CORRECTION from the mount_matrix InputPlumber uses on this device."""
-    global HANDHELD_CORRECTION
+    global HANDHELD_CORRECTION, HANDHELD_GYRO_CORRECTION
+    HANDHELD_GYRO_CORRECTION = None
     if board is None:
         try:
             board = open("/sys/class/dmi/id/board_name").read().strip()
         except OSError:
             board = ""
     if board != ALLY_X_BOARD:
+        try:
+            model = open("/sys/firmware/devicetree/base/model").read().strip("\x00\n\r ")
+        except OSError:
+            model = ""
+        if model == ODIN_3_MODEL:
+            HANDHELD_CORRECTION = ODIN_3_ACCEL_CORRECTION
+            HANDHELD_GYRO_CORRECTION = ODIN_3_GYRO_CORRECTION
+            log(f"handheld: {model} -> accel correction {HANDHELD_CORRECTION}, "
+                f"gyro correction {HANDHELD_GYRO_CORRECTION}")
+            return HANDHELD_CORRECTION
         HANDHELD_CORRECTION = IDENTITY
         log(f"handheld: board {board or 'unknown'} not verified, using InputPlumber's frame as is "
             "(check the poses with --sources)")
@@ -279,7 +294,10 @@ def correct_handheld(accel, gyro, correction=None):
     """
     c = HANDHELD_CORRECTION if correction is None else correction
     d = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
-    return mat_vec(c, accel), mat_vec(mat_mul(mat_mul(d, c), d), gyro)
+    g = HANDHELD_GYRO_CORRECTION if correction is None else None
+    if g is None:
+        g = mat_mul(mat_mul(d, c), d)
+    return mat_vec(c, accel), mat_vec(g, gyro)
 
 
 def is_virtual_device(device_dir):
