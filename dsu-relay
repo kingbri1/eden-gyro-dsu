@@ -20,8 +20,6 @@ The motion sources are picked automatically:
       - InputPlumber's virtual Steam Deck controller (the default target, InputPlumber 0.82 or later),
         read from its hidraw node, so no target change is needed and Steam Input keeps its gyro,
       - iio-dsu-bridge on 127.0.0.1:26760 (InputPlumber 0.81 or earlier, which leaves the IMU free).
-    On the ROG Ally X the relay reads the mount_matrix InputPlumber uses and rotates its virtual pads
-    into the frame the emulators expect, so it keeps working if InputPlumber changes that matrix.
 
 So docking the handheld and turning on one or more DualSense pads switches the motion sources with no
 config change in the emulators, and turning them off switches back to the handheld IMU.
@@ -32,13 +30,12 @@ InputPlumber 0.81 plus the bridge config from iio-dsu-bridge issue #15
 
 Usage:
   dsu-relay                 run the relay
-  dsu-relay --sources 20    print the motion sources and their slots (to check poses and pad order)
+  dsu-relay --sources 20    log the motion sources and their slots (to check poses and pad order)
 """
 import argparse
-import glob
 import os
+import pathlib
 import random
-import re
 import select
 import socket
 import struct
@@ -75,22 +72,18 @@ DECK_VENDOR = "000028DE"
 DECK_ACC_RES_PER_G = 16384.0
 DECK_GYRO_RES_PER_DEG_S = 32768.0 / 2000.0
 
-# Handheld IMU from InputPlumber's virtual pads. InputPlumber rotates the raw IIO axes with the mount_matrix
-# of its device config; the emulators want another frame (flat pad = handheld lying screen up). The relay
-# reads that mount_matrix and undoes it, so it keeps working whatever matrix InputPlumber ships.
-IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-INPUTPLUMBER_DEVICE_DIRS = ("/etc/inputplumber/devices.d", "/usr/share/inputplumber/devices")
-# ROG Ally X: raw bmi323 axes are x = right, y = -(screen up), z = -(screen normal). This maps them to the
-# SDL-convention frame that Cemu and Eden expect (verified in game; same frame as iio-dsu-bridge issue #15).
-ALLY_X_BOARD = "RC72LA"
-ALLY_X_EMULATOR_FRAME = ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))
-ALLY_X_MATRIX_083 = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))  # InputPlumber 0.82-0.83
-ODIN_3_MODEL = "AYN Odin 3"
-ODIN_3_ACCEL_CORRECTION = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0))
-ODIN_3_GYRO_CORRECTION = ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-HANDHELD_CORRECTION = IDENTITY  # set by configure_handheld() at startup
-HANDHELD_GYRO_CORRECTION = None  # device-specific override when accel and gyro need different corrections
-
+# Device-specific correction profiles, default provided
+HANDHELD_CORRECTIONS = {
+    "AYN Odin 3": {
+        "accel": ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0)),
+        "gyro": ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, -1.0)),
+    },
+    "default": {
+        "accel": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        "gyro": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    }
+}
+SELECTED_CORRECTION = HANDHELD_CORRECTIONS["default"]
 
 def finish_packet(buf):
     struct.pack_into("<I", buf, 8, 0)
@@ -200,104 +193,32 @@ def mat_vec(m, v):
     return tuple(m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] for i in range(3))
 
 
-def mat_mul(a, b):
-    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+def configure_handheld(identifier=None):
+    """Select the handheld's accel and gyro corrections by device identifier."""
 
+    global SELECTED_CORRECTION
 
-def transpose(m):
-    return tuple(tuple(m[j][i] for j in range(3)) for i in range(3))
-
-
-def is_rotation(m):
-    product = mat_mul(m, transpose(m))
-    return all(abs(product[i][j] - IDENTITY[i][j]) < 1e-6 for i in range(3) for j in range(3))
-
-
-def parse_mount_matrix(text):
-    """The (x, y, z) rows of the first mount_matrix in an InputPlumber device config, or None."""
-    match = re.search(r"\n\s*mount_matrix:\s*\n\s*x:\s*\[([^\]]*)\]\s*\n\s*y:\s*\[([^\]]*)\]\s*\n\s*z:\s*\[([^\]]*)\]",
-                      "\n" + text)
-    if not match:
-        return None
-    try:
-        rows = tuple(tuple(float(v) for v in group.split(",")) for group in match.groups())
-    except ValueError:
-        return None
-    return rows if all(len(row) == 3 for row in rows) else None
-
-
-def find_inputplumber_matrix(board, dirs=INPUTPLUMBER_DEVICE_DIRS):
-    """(mount_matrix, path) of the InputPlumber config used for this board, or None.
-
-    Same order as InputPlumber: configs sorted by file name, and for the same name /etc wins.
-    """
-    entries = []
-    for priority, directory in enumerate(dirs):
-        for path in glob.glob(os.path.join(directory, "*.yaml")):
-            entries.append((os.path.basename(path), priority, path))
-    for _, _, path in sorted(entries):
+    if identifier is None:
         try:
-            text = open(path, encoding="utf-8").read()
+            identifier = pathlib.Path(
+                "/sys/firmware/devicetree/base/model"
+            ).read_text().strip("\x00\n\r ")
         except OSError:
-            continue
-        if re.search(r"board_name:\s*" + re.escape(board) + r"\s*$", text, re.M) and "iio:" in text:
-            matrix = parse_mount_matrix(text)
-            if matrix:
-                return matrix, path
-    return None
+            identifier = "default"
 
-
-def handheld_correction_for(matrix):
-    """Rotation that takes InputPlumber's frame (mount_matrix applied to the raw axes) to the emulator frame."""
-    return mat_mul(ALLY_X_EMULATOR_FRAME, transpose(matrix))
-
-
-def configure_handheld(log=print, dirs=INPUTPLUMBER_DEVICE_DIRS, board=None):
-    """Set HANDHELD_CORRECTION from the mount_matrix InputPlumber uses on this device."""
-    global HANDHELD_CORRECTION, HANDHELD_GYRO_CORRECTION
-    HANDHELD_GYRO_CORRECTION = None
-    if board is None:
-        try:
-            board = open("/sys/class/dmi/id/board_name").read().strip()
-        except OSError:
-            board = ""
-    if board != ALLY_X_BOARD:
-        try:
-            model = open("/sys/firmware/devicetree/base/model").read().strip("\x00\n\r ")
-        except OSError:
-            model = ""
-        if model == ODIN_3_MODEL:
-            HANDHELD_CORRECTION = ODIN_3_ACCEL_CORRECTION
-            HANDHELD_GYRO_CORRECTION = ODIN_3_GYRO_CORRECTION
-            log(f"handheld: {model} -> accel correction {HANDHELD_CORRECTION}, "
-                f"gyro correction {HANDHELD_GYRO_CORRECTION}")
-            return HANDHELD_CORRECTION
-        HANDHELD_CORRECTION = IDENTITY
-        log(f"handheld: board {board or 'unknown'} not verified, using InputPlumber's frame as is "
+    device_corrections = HANDHELD_CORRECTIONS.get(identifier)
+    if device_corrections is None:
+        print(f"handheld: device {identifier or 'unknown'} not verified, using InputPlumber's frame as is "
             "(check the poses with --sources)")
-        return HANDHELD_CORRECTION
-    found = find_inputplumber_matrix(board, dirs)
-    if found and is_rotation(found[0]):
-        matrix, origin = found
     else:
-        matrix, origin = ALLY_X_MATRIX_083, "not found, assuming InputPlumber 0.83"
-    HANDHELD_CORRECTION = handheld_correction_for(matrix)
-    log(f"handheld: InputPlumber mount_matrix {matrix} ({origin}) -> correction {HANDHELD_CORRECTION}")
-    return HANDHELD_CORRECTION
+        SELECTED_CORRECTION = device_corrections
+        print(f"handheld: {identifier} -> accel correction {device_corrections['accel']}, "
+            f"gyro correction {device_corrections['gyro']}")
 
 
-def correct_handheld(accel, gyro, correction=None):
-    """Apply the handheld correction to DSU-convention accel and gyro.
-
-    The correction is a rotation in SDL's frame. DSU accel is the negated SDL accel, so it rotates the
-    same way; DSU gyro is SDL gyro with y and z flipped (D), so it rotates by D * C * D.
-    """
-    c = HANDHELD_CORRECTION if correction is None else correction
-    d = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
-    g = HANDHELD_GYRO_CORRECTION if correction is None else None
-    if g is None:
-        g = mat_mul(mat_mul(d, c), d)
-    return mat_vec(c, accel), mat_vec(g, gyro)
+def correct_handheld(accel, gyro):
+    """Apply the selected handheld corrections to DSU-convention accel and gyro."""
+    return mat_vec(SELECTED_CORRECTION["accel"], accel), mat_vec(SELECTED_CORRECTION["gyro"], gyro)
 
 
 def is_virtual_device(device_dir):
@@ -386,20 +307,29 @@ class DualSenseManager:
 
     @staticmethod
     def find_nodes():
+        input_dir = pathlib.Path("/sys/class/input")
+        dev_input_dir = pathlib.Path("/dev/input")
+
         found = []
-        for name_file in sorted(glob.glob("/sys/class/input/event*/device/name")):
+        for name_file in sorted(input_dir.glob("event*/device/name")):
             try:
-                name = open(name_file).read().strip()
+                name = name_file.read_text().strip()
             except OSError:
                 continue
+
             if "Motion Sensors" not in name or "DualSense" not in name:
                 continue
-            device_dir = os.path.dirname(name_file)
+
+            device_dir = name_file.parent
+            uniq_file = device_dir / "uniq"
+            device_path = dev_input_dir / device_dir.parent.name
             try:
-                uniq = open(os.path.join(device_dir, "uniq")).read().strip()
+                uniq = uniq_file.read_text().strip()
             except OSError:
                 uniq = ""
-            found.append(("/dev/input/" + name_file.split("/")[4], uniq, name, is_virtual_device(device_dir)))
+
+            found.append((str(device_path), uniq, name, is_virtual_device(device_dir)))
+
         return found
 
     def live(self, now):
@@ -471,15 +401,18 @@ class DeckSource:
 
     @staticmethod
     def find_nodes():
+        hidraw_dir = pathlib.Path("/sys/class/hidraw")
+        dev_dir = pathlib.Path("/dev")
         nodes = []
-        for uevent in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
+        for uevent in sorted(hidraw_dir.glob("hidraw*/device/uevent")):
             try:
-                fields = dict(line.split("=", 1) for line in open(uevent).read().splitlines() if "=" in line)
+                fields = dict(line.split("=", 1) for line in uevent.read_text().splitlines() if "=" in line)
             except OSError:
                 continue
             parts = fields.get("HID_ID", "").split(":")
             if len(parts) == 3 and parts[1].upper() == DECK_VENDOR:
-                nodes.append("/dev/" + uevent.split("/")[4])
+                device_path = dev_dir / uevent.parent.parent.name
+                nodes.append(str(device_path))
         return nodes
 
     def run(self, stop):
@@ -546,10 +479,9 @@ HOLD = _Hold()
 
 
 class Relay:
-    def __init__(self, listen_port=26761, rate=200.0, host="127.0.0.1", log=print,
+    def __init__(self, listen_port=26761, rate=200.0, host="127.0.0.1",
                  bridge=None, dualsense=None, deck=None):
         self.rate = rate
-        self.log = log
         self.server_id = random.getrandbits(32)
         self.bridge = bridge if bridge is not None else BridgeSource(host)
         self.dualsense = dualsense if dualsense is not None else DualSenseManager()
@@ -642,7 +574,7 @@ class Relay:
             self.active_slots = set(sources)
             layout = ", ".join(f"slot {slot + 1}: {src.name}" for slot, (src, _, _) in sorted(sources.items()))
             if layout != self.layout:
-                self.log(f"motion sources -> {layout or 'none'}")
+                print(f"motion sources -> {layout or 'none'}")
                 self.layout = layout
 
             with self.lock:
@@ -691,9 +623,9 @@ class Relay:
 
     def run(self, seconds=0):
         self.start()
-        self.log(f"DSU relay on 127.0.0.1:{self.listen_port} at {self.rate:g} Hz "
+        print(f"DSU relay on 127.0.0.1:{self.listen_port} at {self.rate:g} Hz "
                  f"(slot 1 = Cemu, slots 2-4 = Eden players 1-3)")
-        start = last_log = time.monotonic()
+        start = last_print = time.monotonic()
         def counters():
             return dict(self.stats, bridge=self.bridge.samples, deck=self.deck.samples,
                         dualsense=self.dualsense.total_samples())
@@ -703,32 +635,33 @@ class Relay:
             while not seconds or time.monotonic() - start < seconds:
                 time.sleep(0.2)
                 now = time.monotonic()
-                if now - last_log >= LOG_EVERY_SECONDS:
-                    window = now - last_log
+                if now - last_print >= LOG_EVERY_SECONDS:
+                    window = now - last_print
                     with self.lock:
                         subs = len(self.subs)
                     current = counters()
                     rate = {k: (current[k] - last[k]) / window for k in current}
-                    self.log(f"{self.layout or 'no source'} | deck {rate['deck']:.0f}/s, "
+                    print(f"{self.layout or 'no source'} | deck {rate['deck']:.0f}/s, "
                              f"dualsense {rate['dualsense']:.0f}/s, bridge {rate['bridge']:.0f}/s, "
                              f"sent {rate['sent']:.0f}/s, subscribers {subs}"
                              + (f" | {self.deck.error}" if self.deck.error else ""))
                     last = current
-                    last_log = now
+                    last_print = now
         except KeyboardInterrupt:
             pass
         finally:
             self.close()
 
 
-def show_sources(seconds, log=print):
+def show_sources(seconds):
     """Print every motion source with its slot, once per second."""
+
     stop = threading.Event()
     bridge, pads, deck = BridgeSource(), DualSenseManager(), DeckSource()
     threads = [threading.Thread(target=s.run, args=(stop,), daemon=True) for s in (bridge, pads, deck)]
     for thread in threads:
         thread.start()
-    log("slot | source                  | accel g            | gyro deg/s")
+    print("slot | source                  | accel g            | gyro deg/s")
     end = time.monotonic() + seconds
     try:
         while time.monotonic() < end:
@@ -739,14 +672,14 @@ def show_sources(seconds, log=print):
             for index, pad in enumerate(extra[:2], start=3):
                 rows.append((str(index), pad.name, pad.latest))
             if deck.error:
-                log(f"note: {deck.error}")
+                print(f"note: {deck.error}")
             if not rows:
-                log("no motion source")
+                print("no motion source")
             for slot, name, sample in rows:
                 _, accel, gyro = sample
-                log(f"{slot:4} | {name:23} | {accel[0]:6.2f} {accel[1]:6.2f} {accel[2]:6.2f} |"
+                print(f"{slot:4} | {name:23} | {accel[0]:6.2f} {accel[1]:6.2f} {accel[2]:6.2f} |"
                     f" {gyro[0]:7.1f} {gyro[1]:7.1f} {gyro[2]:7.1f}")
-            log("")
+            print(" ")
     except KeyboardInterrupt:
         pass
     finally:
@@ -760,14 +693,14 @@ def main():
     parser.add_argument("--listen-port", type=int, default=26761)
     parser.add_argument("--rate", type=float, default=200.0)
     parser.add_argument("--sources", type=float, metavar="SECONDS",
-                        help="print the motion sources and their slots instead of running the relay")
+                        help="log the motion sources and their slots instead of running the relay")
     args = parser.parse_args()
-    log = lambda text: print(text, flush=True)
-    configure_handheld(log)
+
+    configure_handheld()
     if args.sources:
-        show_sources(args.sources, log=log)
+        show_sources(args.sources)
         return
-    Relay(args.listen_port, args.rate, log=log).run()
+    Relay(args.listen_port, args.rate).run()
 
 
 if __name__ == "__main__":
